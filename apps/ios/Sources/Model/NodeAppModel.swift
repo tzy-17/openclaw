@@ -28,6 +28,11 @@ private struct ExecApprovalGatewayEventPayload: Decodable {
     var id: String
 }
 
+private struct NodeEventRequestPayload: Encodable {
+    var event: String
+    var payloadJSON: String
+}
+
 /// Ensures notification requests return promptly even if the system prompt blocks.
 private final class NotificationInvokeLatch<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
@@ -106,6 +111,7 @@ final class NodeAppModel {
     }
 
     private let deepLinkLogger = Logger(subsystem: "ai.openclawfoundation.app", category: "DeepLink")
+    private nonisolated static let agentRequestNodeEventTimeoutSeconds = 8
     private nonisolated static let execApprovalNotificationGuidanceSuppressedKey =
         "notifications.execApprovalGuidance.suppressed"
     private let pushWakeLogger = Logger(subsystem: "ai.openclawfoundation.app", category: "PushWake")
@@ -203,6 +209,9 @@ final class NodeAppModel {
     private let remindersService: any RemindersServicing
     private let motionService: any MotionServicing
     private let watchMessagingService: any WatchMessagingServicing
+    #if DEBUG
+    @ObservationIgnored private var testAgentRequestHandler: ((AgentDeepLink) async throws -> Void)?
+    #endif
     private var pttVoiceWakeSuspended = false
     private var talkVoiceWakeSuspended = false
     private var backgroundVoiceWakeSuspended = false
@@ -3240,9 +3249,16 @@ extension NodeAppModel {
     }
 
     private func handleWatchQuickReply(_ event: WatchQuickReplyEvent) async {
-        switch await self.watchReplyCoordinator.ingest(event, isGatewayConnected: self.isGatewayConnected()) {
+        let gatewayStableID = self.currentWatchReplyGatewayStableID()
+        switch await self.watchReplyCoordinator.ingest(
+            event,
+            isGatewayConnected: self.isGatewayConnected(),
+            gatewayStableID: gatewayStableID)
+        {
         case .dropMissingFields:
             self.watchReplyLogger.info("watch reply dropped: missing replyId/actionId")
+        case .dropMissingTarget:
+            self.watchReplyLogger.info("watch reply dropped: missing gateway target")
         case let .deduped(replyId):
             self.watchReplyLogger.debug(
                 "watch reply deduped replyId=\(replyId, privacy: .public)")
@@ -3250,17 +3266,27 @@ extension NodeAppModel {
             self.watchReplyLogger.info(
                 "watch reply queued replyId=\(replyId, privacy: .public) action=\(actionId, privacy: .public)")
         case .forward:
-            await self.forwardWatchReplyToAgent(event)
+            _ = await self.forwardWatchReplyToAgent(event)
         }
     }
 
     private func flushQueuedWatchRepliesIfConnected() async {
-        for event in await self.watchReplyCoordinator.drainIfConnected(self.isGatewayConnected()) {
-            await self.forwardWatchReplyToAgent(event)
+        let gatewayStableID = self.currentWatchReplyGatewayStableID()
+        while let event = await self.watchReplyCoordinator.nextQueuedReply(
+            isGatewayConnected: self.isGatewayConnected(),
+            gatewayStableID: gatewayStableID)
+        {
+            let forwarded = await self.forwardWatchReplyToAgent(event)
+            guard forwarded else { return }
+            self.watchReplyCoordinator.removeQueuedReply(replyId: event.replyId, gatewayStableID: gatewayStableID)
         }
     }
 
-    private func forwardWatchReplyToAgent(_ event: WatchQuickReplyEvent) async {
+    private func currentWatchReplyGatewayStableID() -> String? {
+        self.connectedGatewayID?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func forwardWatchReplyToAgent(_ event: WatchQuickReplyEvent) async -> Bool {
         let sessionKey = event.sessionKey?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveSessionKey = (sessionKey?.isEmpty == false) ? sessionKey : self.mainSessionKey
         let message = Self.makeWatchReplyAgentMessage(event)
@@ -3280,12 +3306,14 @@ extension NodeAppModel {
                     + "action=\(event.actionId)"
             self.watchReplyLogger.info("\(forwardedMessage, privacy: .public)")
             self.openChatRequestID &+= 1
+            return true
         } catch {
             let failedMessage =
                 "watch reply forwarding failed replyId=\(event.replyId) "
                     + "error=\(error.localizedDescription)"
             self.watchReplyLogger.error("\(failedMessage, privacy: .public)")
-            self.watchReplyCoordinator.requeueFront(event)
+            self.watchReplyCoordinator.requeueFront(event, gatewayStableID: self.currentWatchReplyGatewayStableID())
+            return false
         }
     }
 
@@ -4990,13 +5018,29 @@ extension NodeAppModel {
             ])
         }
 
+        #if DEBUG
+        if let testAgentRequestHandler {
+            try await testAgentRequestHandler(link)
+            return
+        }
+        #endif
+
         let data = try JSONEncoder().encode(link)
         guard let json = String(bytes: data, encoding: .utf8) else {
             throw NSError(domain: "NodeAppModel", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "Failed to encode agent request payload as UTF-8",
             ])
         }
-        await self.nodeGateway.sendEvent(event: "agent.request", payloadJSON: json)
+        let requestData = try JSONEncoder().encode(NodeEventRequestPayload(event: "agent.request", payloadJSON: json))
+        guard let requestJSON = String(bytes: requestData, encoding: .utf8) else {
+            throw NSError(domain: "NodeAppModel", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to encode agent request node event as UTF-8",
+            ])
+        }
+        _ = try await self.nodeGateway.request(
+            method: "node.event",
+            paramsJSON: requestJSON,
+            timeoutSeconds: Self.agentRequestNodeEventTimeoutSeconds)
     }
 
     private func isGatewayConnected() async -> Bool {
@@ -5181,8 +5225,16 @@ extension NodeAppModel {
         self.connectedGatewayID = gatewayID
     }
 
+    func _test_setAgentRequestHandler(_ handler: (@escaping (AgentDeepLink) async throws -> Void)) {
+        self.testAgentRequestHandler = handler
+    }
+
     static func _test_resetPersistedWatchChatQueueState() {
         WatchChatCoordinator.resetPersistedQueue()
+    }
+
+    static func _test_resetPersistedWatchReplyQueueState() {
+        WatchReplyCoordinator.resetPersistedQueue()
     }
 
     func _test_setGatewayConnected(_ connected: Bool) {

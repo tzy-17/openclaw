@@ -76,7 +76,7 @@ struct WatchMessagingStatus: Equatable {
     var activationState: String
 }
 
-struct WatchQuickReplyEvent: Equatable {
+struct WatchQuickReplyEvent: Codable, Equatable {
     var replyId: String
     var promptId: String
     var actionId: String

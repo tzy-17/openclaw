@@ -1716,8 +1716,11 @@ private final class MockBootstrapNotificationCenter: NotificationCentering, @unc
     }
 
     @Test @MainActor func watchReplyQueuesWhenGatewayOffline() async {
+        NodeAppModel._test_resetPersistedWatchReplyQueueState()
+        defer { NodeAppModel._test_resetPersistedWatchReplyQueueState() }
         let watchService = MockWatchMessagingService()
         let appModel = NodeAppModel(watchMessagingService: watchService)
+        appModel._test_setConnectedGatewayID("gateway-watch-reply")
         watchService.emitReply(
             WatchQuickReplyEvent(
                 replyId: "reply-offline-1",
@@ -1730,6 +1733,39 @@ private final class MockBootstrapNotificationCenter: NotificationCentering, @unc
                 transport: "transferUserInfo"))
         await Task.yield()
         #expect(appModel._test_queuedWatchReplyCount() == 1)
+    }
+
+    @Test @MainActor func watchReplyCoordinatorRestoresQueuedReplyAfterRestart() throws {
+        let suiteName = "watch-reply-queue-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let event = WatchQuickReplyEvent(
+            replyId: "reply-restore-1",
+            promptId: "prompt-restore",
+            actionId: "approve",
+            actionLabel: "Approve",
+            sessionKey: "ios",
+            note: nil,
+            sentAtMs: 1235,
+            transport: "transferUserInfo")
+        let firstCoordinator = WatchReplyCoordinator(defaults: defaults)
+        if case .queue = firstCoordinator.ingest(event, isGatewayConnected: false, gatewayStableID: "gateway-a") {
+        } else {
+            Issue.record("expected watch reply to queue")
+        }
+
+        let secondCoordinator = WatchReplyCoordinator(defaults: defaults)
+        #expect(secondCoordinator.nextQueuedReply(isGatewayConnected: true, gatewayStableID: "gateway-b") == nil)
+        let restored = secondCoordinator.nextQueuedReply(isGatewayConnected: true, gatewayStableID: "gateway-a")
+
+        #expect(restored == event)
+        #expect(secondCoordinator.queuedCount == 1)
+        secondCoordinator.removeQueuedReply(replyId: event.replyId, gatewayStableID: "gateway-a")
+        #expect(secondCoordinator.queuedCount == 0)
     }
 
     @Test @MainActor func handleDeepLinkSetsErrorWhenNotConnected() async throws {
@@ -1750,6 +1786,7 @@ private final class MockBootstrapNotificationCenter: NotificationCentering, @unc
     @Test @MainActor func handleDeepLinkRequiresConfirmationWhenConnectedAndUnkeyed() async {
         let appModel = NodeAppModel()
         appModel._test_setGatewayConnected(true)
+        appModel._test_setAgentRequestHandler { _ in }
         let url = makeAgentDeepLinkURL(message: "hello from deep link")
 
         await appModel.handleDeepLink(url: url)
@@ -1805,6 +1842,7 @@ private final class MockBootstrapNotificationCenter: NotificationCentering, @unc
     @Test @MainActor func handleDeepLinkBypassesPromptWithValidKey() async {
         let appModel = NodeAppModel()
         appModel._test_setGatewayConnected(true)
+        appModel._test_setAgentRequestHandler { _ in }
         let key = NodeAppModel._test_currentDeepLinkKey()
         let url = makeAgentDeepLinkURL(message: "trusted request", key: key)
 
