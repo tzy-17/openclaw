@@ -5225,7 +5225,7 @@ extension NodeAppModel {
         self.connectedGatewayID = gatewayID
     }
 
-    func _test_setAgentRequestHandler(_ handler: (@escaping (AgentDeepLink) async throws -> Void)) {
+    func _test_setAgentRequestHandler(_ handler: @escaping (AgentDeepLink) async throws -> Void) {
         self.testAgentRequestHandler = handler
     }
 

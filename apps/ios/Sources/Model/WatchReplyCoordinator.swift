@@ -79,7 +79,8 @@ final class WatchReplyCoordinator {
         if !replyId.isEmpty {
             self.rememberRecentReplyKey(self.replyKey(gatewayStableID: owner, replyId: replyId))
             self.queuedReplies.removeAll {
-                $0.gatewayStableID == owner && $0.event.replyId.trimmingCharacters(in: .whitespacesAndNewlines) == replyId
+                $0.gatewayStableID == owner
+                    && $0.event.replyId.trimmingCharacters(in: .whitespacesAndNewlines) == replyId
             }
         }
         self.queuedReplies.insert(QueuedReply(gatewayStableID: owner, event: event), at: 0)
@@ -133,7 +134,10 @@ final class WatchReplyCoordinator {
 
     private func rebuildSeenReplyKeys() {
         var ids = Set(self.recentReplyKeys)
-        ids.formUnion(self.queuedReplies.map { self.replyKey(gatewayStableID: $0.gatewayStableID, replyId: $0.event.replyId) })
+        ids.formUnion(
+            self.queuedReplies.map {
+                self.replyKey(gatewayStableID: $0.gatewayStableID, replyId: $0.event.replyId)
+            })
         self.seenReplyKeys = ids
     }
 
