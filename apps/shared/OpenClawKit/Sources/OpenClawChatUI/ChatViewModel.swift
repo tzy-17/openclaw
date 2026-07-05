@@ -507,7 +507,10 @@ public final class OpenClawChatViewModel {
             let reconciled = Self.reconcileMessageIDs(
                 previous: self.messages,
                 incoming: self.messages + incoming)
-            self.replaceMessages(Self.dedupeMessages(reconciled))
+            // The gap-triggering newer push is delivered before this async
+            // fetch returns, so a blind append would leave the missed older
+            // rows after it; restore transcript order for seq-stamped rows.
+            self.replaceMessages(Self.reorderTranscriptSeqRows(Self.dedupeMessages(reconciled)))
             self.prunePendingLocalUserEchoMessageIDs()
             self.clearProvisionalFinalMarkersAdoptedByHistory(incoming)
             self.pruneProvisionalFinalMessages()
@@ -532,6 +535,22 @@ public final class OpenClawChatViewModel {
             self.markHistoryRequestApplied(request)
         }
         return true
+    }
+
+    // Puts seq-stamped transcript rows back into seq order while seq-less rows
+    // (optimistic echoes, provisional finals) stay anchored at their positions.
+    private static func reorderTranscriptSeqRows(
+        _ messages: [OpenClawChatMessage]) -> [OpenClawChatMessage]
+    {
+        let seqIndices = messages.indices.filter { messages[$0].transcriptSeq != nil }
+        guard seqIndices.count > 1 else { return messages }
+        let orderedRows = seqIndices.map { messages[$0] }
+            .sorted { ($0.transcriptSeq ?? 0) < ($1.transcriptSeq ?? 0) }
+        var result = messages
+        for (offset, index) in seqIndices.enumerated() {
+            result[index] = orderedRows[offset]
+        }
+        return result
     }
 
     // Reconnect refetch: with a known cursor, fetch only missed rows and loop
@@ -2262,7 +2281,8 @@ public final class OpenClawChatViewModel {
 
         guard let message = payload.message else { return }
 
-        let sanitized = Self.stripInboundMetadata(from: message)
+        let sanitized = Self.stripInboundMetadata(
+            from: Self.messageWithTranscriptSeqIfMissing(message, seq: payload.messageSeq))
 
         // The active client also receives the gateway's echo of the user turn it
         // just sent. performSend already appended an optimistic row carrying a
@@ -2394,6 +2414,28 @@ public final class OpenClawChatViewModel {
 
     private static func isAssistantMessage(_ message: OpenClawChatMessage) -> Bool {
         message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant"
+    }
+
+    // The session.message envelope mirrors the row's transcript seq; adopt it
+    // when the projected body lost the metadata so seq-gap delta reordering can
+    // still place the pushed row at its transcript position.
+    private static func messageWithTranscriptSeqIfMissing(
+        _ message: OpenClawChatMessage,
+        seq: Int?) -> OpenClawChatMessage
+    {
+        guard message.transcriptSeq == nil, let seq, seq > 0 else { return message }
+        return OpenClawChatMessage(
+            id: message.id,
+            role: message.role,
+            content: message.content,
+            timestamp: message.timestamp,
+            idempotencyKey: message.idempotencyKey,
+            transcriptSeq: seq,
+            toolCallId: message.toolCallId,
+            toolName: message.toolName,
+            usage: message.usage,
+            stopReason: message.stopReason,
+            errorMessage: message.errorMessage)
     }
 
     private static func messageWithTimestampIfNeeded(_ message: OpenClawChatMessage) -> OpenClawChatMessage {

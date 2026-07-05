@@ -244,6 +244,55 @@ struct ChatHistoryAfterSeqTests {
     }
 
     @Test
+    func deltaRowsLandBeforeNewerPushedRowDeliveredDuringGap() async throws {
+        // The transport delivers the gap-triggering newer push right after the
+        // seqGap signal, so it can apply before the async delta returns. The
+        // missed older rows must still land at their transcript positions.
+        let bootstrap = fullPayload(messages: [
+            seqMessage(role: "user", text: "hi", timestamp: 1000, seq: 1, idempotencyKey: "u1"),
+            seqMessage(role: "assistant", text: "hello", timestamp: 2000, seq: 2),
+        ])
+        let delta = deltaPayload(
+            afterSeq: 2,
+            nextAfterSeq: 4,
+            hasMore: false,
+            totalMessages: 4,
+            messages: [
+                seqMessage(role: "assistant", text: "missed", timestamp: 3000, seq: 3),
+                seqMessage(role: "assistant", text: "newest", timestamp: 4000, seq: 4),
+            ])
+        let transport = AfterSeqChatTransport(
+            fullResponses: [bootstrap],
+            deltaResponses: [delta])
+        let vm = try await makeLoadedViewModel(transport: transport)
+
+        // Newer row (seq 4) lands via push before the catch-up fetch runs.
+        let pushed = try #require(try? JSONDecoder().decode(
+            OpenClawChatMessage.self,
+            from: JSONEncoder().encode(
+                seqMessage(role: "assistant", text: "newest", timestamp: 4000, seq: 4))))
+        transport.emit(
+            .sessionMessage(
+                OpenClawSessionMessageEventPayload(
+                    sessionKey: "main",
+                    message: pushed,
+                    messageId: "m4",
+                    messageSeq: 4)))
+        try await waitUntil("pushed row applied") {
+            await MainActor.run { vm.messages.count == 3 }
+        }
+
+        transport.emit(.seqGap)
+        try await waitUntil("delta reordered") {
+            await MainActor.run { vm.messages.count == 4 }
+        }
+
+        #expect(await transport.deltaCalls() == [2])
+        let texts = await visibleTexts(vm)
+        #expect(texts == ["hi", "hello", "missed", "newest"])
+    }
+
+    @Test
     func legacyResponseWithoutCursorEchoFallsBackToFullReplace() async throws {
         let bootstrap = fullPayload(messages: [
             seqMessage(role: "user", text: "hi", timestamp: 1000, seq: 1, idempotencyKey: "u1"),
