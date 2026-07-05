@@ -8,6 +8,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- **Windows Scheduled Task recovery:** keep clean early exits inside the existing bounded launch poll, falling back only when neither the task process nor Gateway listener becomes observable. (#76245)
 - **iMessage group warnings:** suppress the false drop-all startup warning when an effective group sender allowlist can admit groups, and point true empty-allowlist configurations at the correct remedy. (#100046)
 
 ## 2026.7.1
