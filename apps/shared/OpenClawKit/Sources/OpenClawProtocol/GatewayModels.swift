@@ -7453,6 +7453,7 @@ public struct DevicePairSetupCodeResult: Codable, Sendable {
     public let setupcode: String
     public let qrdataurl: String?
     public let gatewayurl: String
+    public let gatewayurls: [String]?
     public let auth: AnyCodable
     public let urlsource: String
 
@@ -7460,12 +7461,14 @@ public struct DevicePairSetupCodeResult: Codable, Sendable {
         setupcode: String,
         qrdataurl: String?,
         gatewayurl: String,
+        gatewayurls: [String]?,
         auth: AnyCodable,
         urlsource: String)
     {
         self.setupcode = setupcode
         self.qrdataurl = qrdataurl
         self.gatewayurl = gatewayurl
+        self.gatewayurls = gatewayurls
         self.auth = auth
         self.urlsource = urlsource
     }
@@ -7474,6 +7477,7 @@ public struct DevicePairSetupCodeResult: Codable, Sendable {
         case setupcode = "setupCode"
         case qrdataurl = "qrDataUrl"
         case gatewayurl = "gatewayUrl"
+        case gatewayurls = "gatewayUrls"
         case auth
         case urlsource = "urlSource"
     }
