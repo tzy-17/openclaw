@@ -1900,6 +1900,9 @@ extension NodeAppModel {
             }
             do {
                 let gatewayStableID = self.currentWatchChatGatewayStableID()
+                self.watchMessageOutbox.recordPromptRoute(
+                    promptID: normalizedParams.promptId,
+                    gatewayStableID: gatewayStableID)
                 let result = try await self.watchMessagingService.sendNotification(
                     id: req.id,
                     params: normalizedParams,
@@ -3266,24 +3269,20 @@ extension NodeAppModel {
             self.watchReplyLogger.info("watch reply dropped: missing replyId/actionId")
             return
         }
-        let sourceGatewayID = event.gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let payloadGatewayID = event.gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let sourceGatewayID = payloadGatewayID.isEmpty
+            ? (self.watchMessageOutbox.gatewayStableID(forPromptID: event.promptId) ?? "")
+            : payloadGatewayID
         let currentGatewayID = self.currentWatchChatGatewayStableID()
         if !sourceGatewayID.isEmpty, let currentGatewayID, currentGatewayID != sourceGatewayID {
             self.watchReplyLogger.info("watch reply dropped: stale gateway target")
             return
         }
-        let gatewayStableID: String
-        if !sourceGatewayID.isEmpty {
-            gatewayStableID = sourceGatewayID
-        } else {
-            // Released Watch builds omit the source gateway. During version skew, bind
-            // the reply to the current gateway before it enters the durable outbox.
-            guard let currentGatewayID else {
-                self.watchReplyLogger.info("watch reply dropped: missing gateway target")
-                return
-            }
-            gatewayStableID = currentGatewayID
+        guard !sourceGatewayID.isEmpty else {
+            self.watchReplyLogger.info("watch reply dropped: unresolved gateway target")
+            return
         }
+        let gatewayStableID = sourceGatewayID
 
         let message = WatchAppCommandEvent(
             commandId: replyID,
@@ -5286,6 +5285,12 @@ extension NodeAppModel {
 
     func _test_queuedWatchChatCommandIds() -> [String] {
         self.watchMessageOutbox.queuedMessageIDs(kind: .chat)
+    }
+
+    func _test_recordWatchPromptRoute(promptID: String, gatewayStableID: String) {
+        self.watchMessageOutbox.recordPromptRoute(
+            promptID: promptID,
+            gatewayStableID: gatewayStableID)
     }
 
     func _test_setConnectedGatewayID(_ gatewayID: String?) {

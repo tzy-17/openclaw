@@ -12,20 +12,34 @@ final class WatchMessageOutbox {
 
     // Keep the shipped chat key so upgrades retain messages already queued by the Watch.
     private static let persistedQueueKey = "watch.chat.command.queue.v1"
+    private static let persistedMetadataKey = "watch.message.outbox.metadata.v1"
     private static let maxRecentMessageIDs = 128
+    private static let maxPromptRoutes = 128
 
     private struct QueuedMessage: Codable, Equatable {
         var gatewayStableID: String
         var event: WatchAppCommandEvent
     }
 
+    private struct PromptRoute: Codable, Equatable {
+        var promptID: String
+        var gatewayStableID: String
+    }
+
+    private struct PersistedMetadata: Codable, Equatable {
+        var recentMessageIDs: [String]
+        var promptRoutes: [PromptRoute]
+    }
+
     private let defaults: UserDefaults
     private var queuedMessages: [QueuedMessage] = []
     private var recentMessageIDs: [String] = []
     private var seenMessageIDs = Set<String>()
+    private var promptRoutes: [PromptRoute] = []
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        self.restoreMetadata()
         self.restoreQueue()
     }
 
@@ -44,13 +58,30 @@ final class WatchMessageOutbox {
         if self.seenMessageIDs.contains(messageID) {
             return .deduped(messageID: messageID)
         }
-        self.rememberRecentMessageID(messageID)
         // Persist before network delivery; iOS may suspend a background callback at any await.
         self.queuedMessages.append(
             QueuedMessage(gatewayStableID: owner, event: self.message(event, taggedFor: owner)))
         self.rebuildSeenMessageIDs()
         self.persistQueue()
         return isAvailable ? .forward : .queue(messageID: messageID)
+    }
+
+    func recordPromptRoute(promptID: String?, gatewayStableID: String?) {
+        let promptID = promptID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let gatewayStableID = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !promptID.isEmpty, promptID != "unknown", !gatewayStableID.isEmpty else { return }
+        self.promptRoutes.removeAll { $0.promptID == promptID }
+        self.promptRoutes.append(PromptRoute(promptID: promptID, gatewayStableID: gatewayStableID))
+        if self.promptRoutes.count > Self.maxPromptRoutes {
+            self.promptRoutes.removeFirst(self.promptRoutes.count - Self.maxPromptRoutes)
+        }
+        self.persistMetadata()
+    }
+
+    func gatewayStableID(forPromptID promptID: String) -> String? {
+        let promptID = promptID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !promptID.isEmpty, promptID != "unknown" else { return nil }
+        return self.promptRoutes.last { $0.promptID == promptID }?.gatewayStableID
     }
 
     func nextQueuedMessage(isAvailable: Bool, gatewayStableID: String?) -> WatchAppCommandEvent? {
@@ -81,7 +112,6 @@ final class WatchMessageOutbox {
         let messageID = event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
         let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !messageID.isEmpty, !owner.isEmpty else { return }
-        self.rememberRecentMessageID(messageID)
         self.queuedMessages.removeAll { $0.event.commandId == messageID }
         self.queuedMessages.insert(
             QueuedMessage(gatewayStableID: owner, event: self.message(event, taggedFor: owner)),
@@ -109,7 +139,6 @@ final class WatchMessageOutbox {
             return
         }
 
-        var seen: [String] = []
         var seenSet = Set<String>()
         self.queuedMessages = persisted.compactMap { queued in
             let owner = queued.gatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -118,10 +147,8 @@ final class WatchMessageOutbox {
             guard !owner.isEmpty, !messageID.isEmpty, !text.isEmpty, seenSet.insert(messageID).inserted else {
                 return nil
             }
-            seen.append(messageID)
             return QueuedMessage(gatewayStableID: owner, event: self.message(queued.event, taggedFor: owner))
         }
-        self.recentMessageIDs = Array(seen.suffix(Self.maxRecentMessageIDs))
         self.rebuildSeenMessageIDs()
         if self.queuedMessages.count != persisted.count {
             self.persistQueue()
@@ -135,6 +162,31 @@ final class WatchMessageOutbox {
         if self.recentMessageIDs.count > Self.maxRecentMessageIDs {
             self.recentMessageIDs.removeFirst(self.recentMessageIDs.count - Self.maxRecentMessageIDs)
         }
+        self.rebuildSeenMessageIDs()
+        self.persistMetadata()
+    }
+
+    private func restoreMetadata() {
+        guard let data = self.defaults.data(forKey: Self.persistedMetadataKey),
+              let metadata = try? JSONDecoder().decode(PersistedMetadata.self, from: data)
+        else { return }
+
+        for rawMessageID in metadata.recentMessageIDs {
+            let messageID = rawMessageID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !messageID.isEmpty else { continue }
+            self.recentMessageIDs.removeAll { $0 == messageID }
+            self.recentMessageIDs.append(messageID)
+        }
+        self.recentMessageIDs = Array(self.recentMessageIDs.suffix(Self.maxRecentMessageIDs))
+
+        for rawRoute in metadata.promptRoutes {
+            let promptID = rawRoute.promptID.trimmingCharacters(in: .whitespacesAndNewlines)
+            let gatewayStableID = rawRoute.gatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !promptID.isEmpty, promptID != "unknown", !gatewayStableID.isEmpty else { continue }
+            self.promptRoutes.removeAll { $0.promptID == promptID }
+            self.promptRoutes.append(PromptRoute(promptID: promptID, gatewayStableID: gatewayStableID))
+        }
+        self.promptRoutes = Array(self.promptRoutes.suffix(Self.maxPromptRoutes))
         self.rebuildSeenMessageIDs()
     }
 
@@ -153,6 +205,14 @@ final class WatchMessageOutbox {
         self.defaults.set(data, forKey: Self.persistedQueueKey)
     }
 
+    private func persistMetadata() {
+        let metadata = PersistedMetadata(
+            recentMessageIDs: self.recentMessageIDs,
+            promptRoutes: self.promptRoutes)
+        guard let data = try? JSONEncoder().encode(metadata) else { return }
+        self.defaults.set(data, forKey: Self.persistedMetadataKey)
+    }
+
     private func message(_ event: WatchAppCommandEvent, taggedFor gatewayStableID: String) -> WatchAppCommandEvent {
         var tagged = event
         tagged.gatewayStableID = gatewayStableID
@@ -165,5 +225,6 @@ final class WatchMessageOutbox {
 
     static func resetPersistedQueue(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: self.persistedQueueKey)
+        defaults.removeObject(forKey: self.persistedMetadataKey)
     }
 }

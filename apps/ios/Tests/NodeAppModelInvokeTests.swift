@@ -1816,6 +1816,48 @@ private final class MockBootstrapNotificationCenter: NotificationCentering, @unc
         #expect(secondOutbox.queuedCount() == 0)
     }
 
+    @Test @MainActor func watchMessageOutboxRestoresDeliveryTombstonesAndPromptRoutes() throws {
+        let suiteName = "watch-message-metadata-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let event = WatchAppCommandEvent(
+            commandId: "delivered-reply",
+            command: .sendChat,
+            sessionKey: "main",
+            gatewayStableID: "gateway-a",
+            text: "Delivered reply",
+            sentAtMs: 1,
+            transport: "sendMessage",
+            messageKind: .quickReply)
+        let firstOutbox = WatchMessageOutbox(defaults: defaults)
+        firstOutbox.recordPromptRoute(promptID: "prompt-a", gatewayStableID: "gateway-a")
+        _ = firstOutbox.ingest(event, isAvailable: true, gatewayStableID: "gateway-a")
+        firstOutbox.removeQueuedMessage(messageID: event.commandId, gatewayStableID: "gateway-a")
+        for index in 0..<140 {
+            let pending = WatchAppCommandEvent(
+                commandId: "pending-\(index)",
+                command: .sendChat,
+                sessionKey: "main",
+                gatewayStableID: "gateway-a",
+                text: "Pending \(index)",
+                sentAtMs: index + 2,
+                transport: "transferUserInfo")
+            _ = firstOutbox.ingest(pending, isAvailable: false, gatewayStableID: "gateway-a")
+        }
+
+        let restoredOutbox = WatchMessageOutbox(defaults: defaults)
+        #expect(restoredOutbox.gatewayStableID(forPromptID: "prompt-a") == "gateway-a")
+        if case .deduped = restoredOutbox.ingest(
+            event,
+            isAvailable: true,
+            gatewayStableID: "gateway-a")
+        {
+        } else {
+            Issue.record("expected delivered reply to remain deduped after restart")
+        }
+    }
+
     @Test @MainActor func watchReplyDropsStaleGatewayTarget() async {
         NodeAppModel._test_resetPersistedWatchReplyQueueState()
         defer { NodeAppModel._test_resetPersistedWatchReplyQueueState() }
@@ -1846,6 +1888,9 @@ private final class MockBootstrapNotificationCenter: NotificationCentering, @unc
         let watchService = MockWatchMessagingService()
         let appModel = NodeAppModel(watchMessagingService: watchService)
         appModel.enterAppleReviewDemoMode()
+        appModel._test_recordWatchPromptRoute(
+            promptID: "prompt-idempotent",
+            gatewayStableID: AppleReviewDemoMode.gatewayID)
         let initialOpenChatRequestID = appModel.openChatRequestID
         let event = WatchQuickReplyEvent(
             replyId: "reply-idempotent",
