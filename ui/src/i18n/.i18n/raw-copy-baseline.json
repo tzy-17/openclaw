@@ -1101,14 +1101,14 @@
       "text": "Default"
     },
     {
-      "count": 1,
+      "count": 2,
       "kind": "object-property",
       "name": "label",
       "path": "ui/src/lib/chat/model-select-state.ts",
       "text": "Fast"
     },
     {
-      "count": 1,
+      "count": 2,
       "kind": "object-property",
       "name": "label",
       "path": "ui/src/lib/chat/model-select-state.ts",
@@ -1956,13 +1956,6 @@
     },
     {
       "count": 1,
-      "kind": "html-attribute",
-      "name": "aria-label",
-      "path": "ui/src/pages/chat/components/chat-message.ts",
-      "text": "Tool returned an error"
-    },
-    {
-      "count": 1,
       "kind": "html-text",
       "name": "text",
       "path": "ui/src/pages/chat/components/chat-message.ts",
@@ -1974,13 +1967,6 @@
       "name": "text",
       "path": "ui/src/pages/chat/components/chat-message.ts",
       "text": "Context"
-    },
-    {
-      "count": 2,
-      "kind": "html-text",
-      "name": "text",
-      "path": "ui/src/pages/chat/components/chat-message.ts",
-      "text": "Error"
     },
     {
       "count": 2,
@@ -2369,24 +2355,17 @@
     },
     {
       "count": 1,
-      "kind": "html-attribute",
-      "name": "aria-label",
-      "path": "ui/src/pages/chat/components/chat-tool-cards.ts",
-      "text": "Tool returned an error"
-    },
-    {
-      "count": 2,
-      "kind": "html-text",
-      "name": "text",
-      "path": "ui/src/pages/chat/components/chat-tool-cards.ts",
-      "text": "Error"
-    },
-    {
-      "count": 1,
       "kind": "html-text",
       "name": "text",
       "path": "ui/src/pages/chat/components/chat-tool-cards.ts",
       "text": "Raw details"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/chat/components/chat-tool-cards.ts",
+      "text": "Tool error"
     },
     {
       "count": 1,
