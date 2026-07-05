@@ -80,10 +80,10 @@ public final class OpenClawChatViewModel {
     // Failed later refreshes must not drop the last successful pending-run history payload.
     private var lastIssuedHistoryRequestID: UInt64 = 0
     private var latestAppliedHistoryRequestID: UInt64 = 0
-    // Highest transcript seq (`__openclaw.seq`) applied from chat.history for the
-    // current session; reconnect catch-up fetches only rows after it. Push events
-    // never advance it: after a detected seq gap the missed rows must still fall
-    // inside the next afterSeq delta fetch.
+    /// Highest transcript seq (`__openclaw.seq`) applied from chat.history for the
+    /// current session; reconnect catch-up fetches only rows after it. Push events
+    /// never advance it: after a detected seq gap the missed rows must still fall
+    /// inside the next afterSeq delta fetch.
     private var lastAppliedTranscriptSeq: Int?
 
     @ObservationIgnored
@@ -494,9 +494,9 @@ public final class OpenClawChatViewModel {
         return true
     }
 
-    // Appends a catch-up page through the same reconcile/dedupe path used for
-    // pushed session rows; idempotency-keyed adoption and dedupe absorb overlap
-    // from lossless re-delivery of budget-trimmed rows.
+    /// Appends a catch-up page through the same reconcile/dedupe path used for
+    /// pushed session rows; idempotency-keyed adoption and dedupe absorb overlap
+    /// from lossless re-delivery of budget-trimmed rows.
     private func appendHistoryDeltaPage(
         _ payload: OpenClawChatHistoryPayload,
         for request: HistoryRequest) -> Bool
@@ -537,8 +537,8 @@ public final class OpenClawChatViewModel {
         return true
     }
 
-    // Puts seq-stamped transcript rows back into seq order while seq-less rows
-    // (optimistic echoes, provisional finals) stay anchored at their positions.
+    /// Puts seq-stamped transcript rows back into seq order while seq-less rows
+    /// (optimistic echoes, provisional finals) stay anchored at their positions.
     private static func reorderTranscriptSeqRows(
         _ messages: [OpenClawChatMessage]) -> [OpenClawChatMessage]
     {
@@ -553,10 +553,10 @@ public final class OpenClawChatViewModel {
         return result
     }
 
-    // Reconnect refetch: with a known cursor, fetch only missed rows and loop
-    // afterSeq = nextAfterSeq while hasMore. A response without the afterSeq
-    // echo means the gateway ignored the cursor param (version skew) and served
-    // a legacy full page; wholesale-replace via the standard path.
+    /// Reconnect refetch: with a known cursor, fetch only missed rows and loop
+    /// afterSeq = nextAfterSeq while hasMore. A response without the afterSeq
+    /// echo means the gateway ignored the cursor param (version skew) and served
+    /// a legacy full page; wholesale-replace via the standard path.
     @discardableResult
     private func refreshHistoryCatchUp(historyRequest request: HistoryRequest) async -> Bool {
         guard var afterSeq = self.lastAppliedTranscriptSeq else {
@@ -2427,9 +2427,9 @@ public final class OpenClawChatViewModel {
         message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant"
     }
 
-    // The session.message envelope mirrors the row's transcript seq; adopt it
-    // when the projected body lost the metadata so seq-gap delta reordering can
-    // still place the pushed row at its transcript position.
+    /// The session.message envelope mirrors the row's transcript seq; adopt it
+    /// when the projected body lost the metadata so seq-gap delta reordering can
+    /// still place the pushed row at its transcript position.
     private static func messageWithTranscriptSeqIfMissing(
         _ message: OpenClawChatMessage,
         seq: Int?) -> OpenClawChatMessage
