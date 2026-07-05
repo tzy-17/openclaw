@@ -568,22 +568,33 @@ public final class OpenClawChatViewModel {
                 let payload = try await transport.requestHistory(
                     sessionKey: request.session.key,
                     afterSeq: afterSeq)
-                guard payload.afterSeq != nil, let nextAfterSeq = payload.nextAfterSeq else {
+                guard payload.afterSeq != nil else {
                     return self.applyHistoryPayload(
                         payload,
                         for: request,
                         preservingOptimisticLocalMessages: true)
                 }
+                guard
+                    payload.afterSeq == afterSeq,
+                    let expectedSessionId = self.sessionId,
+                    payload.sessionId == expectedSessionId,
+                    let nextAfterSeq = payload.nextAfterSeq,
+                    nextAfterSeq >= afterSeq
+                else {
+                    return await self.refreshHistoryAfterRun(historyRequest: request)
+                }
+                if payload.hasMore == true, nextAfterSeq == afterSeq {
+                    return await self.refreshHistoryAfterRun(historyRequest: request)
+                }
                 guard self.appendHistoryDeltaPage(payload, for: request) else { return appliedAny }
                 appliedAny = true
-                // A non-advancing cursor would loop forever; stop and let the
-                // next reconnect retry from the same position.
-                guard payload.hasMore == true, nextAfterSeq > afterSeq else { return true }
+                guard payload.hasMore == true else { return true }
                 afterSeq = nextAfterSeq
             }
         } catch {
             chatUILogger.error("catch-up history failed \(error.localizedDescription, privacy: .public)")
-            return appliedAny
+            let refetched = await self.refreshHistoryAfterRun(historyRequest: request)
+            return refetched || appliedAny
         }
     }
 

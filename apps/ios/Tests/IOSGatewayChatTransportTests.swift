@@ -46,6 +46,24 @@ import Testing
         #expect(params["limit"] as? Int == 12)
     }
 
+    @Test func fullHistoryParamsSeedTheGlobalTranscriptCursor() throws {
+        let params = try self.object(
+            from: IOSGatewayChatTransport.makeHistoryParamsJSON(sessionKey: "agent:main:ios"))
+        #expect(params["sessionKey"] as? String == "agent:main:ios")
+        #expect(params["offset"] as? Int == 0)
+        #expect(params["afterSeq"] == nil)
+    }
+
+    @Test func catchUpHistoryParamsUseOnlyAfterSeq() throws {
+        let params = try self.object(
+            from: IOSGatewayChatTransport.makeHistoryParamsJSON(
+                sessionKey: "agent:main:ios",
+                afterSeq: 42))
+        #expect(params["sessionKey"] as? String == "agent:main:ios")
+        #expect(params["offset"] == nil)
+        #expect(params["afterSeq"] as? Int == 42)
+    }
+
     @Test func commandsListParamsRequestTextScopeWithArgs() throws {
         let params = try self.object(from: IOSGatewayChatTransport.makeCommandsListParamsJSON())
         #expect(params["scope"] as? String == "text")

@@ -146,12 +146,16 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         try self.encodeParams(SessionKeyParams(key: sessionKey))
     }
 
-    private static func makeHistoryParamsJSON(sessionKey: String, afterSeq: Int? = nil) throws -> String {
+    static func makeHistoryParamsJSON(sessionKey: String, afterSeq: Int? = nil) throws -> String {
         struct Params: Codable {
             var sessionKey: String
+            var offset: Int?
             var afterSeq: Int?
         }
-        return try self.encodeParams(Params(sessionKey: sessionKey, afterSeq: afterSeq))
+        return try self.encodeParams(Params(
+            sessionKey: sessionKey,
+            offset: afterSeq == nil ? 0 : nil,
+            afterSeq: afterSeq))
     }
 
     private static func makeAgentWaitParamsJSON(runId: String, timeoutMs: Int) throws -> String {

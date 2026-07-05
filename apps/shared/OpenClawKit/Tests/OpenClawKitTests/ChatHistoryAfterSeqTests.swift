@@ -43,6 +43,7 @@ private func fullPayload(
 }
 
 private func deltaPayload(
+    sessionId: String = "sess-main",
     afterSeq: Int,
     nextAfterSeq: Int,
     hasMore: Bool,
@@ -51,7 +52,7 @@ private func deltaPayload(
 {
     OpenClawChatHistoryPayload(
         sessionKey: "main",
-        sessionId: "sess-main",
+        sessionId: sessionId,
         messages: messages,
         thinkingLevel: "off",
         afterSeq: afterSeq,
@@ -84,6 +85,7 @@ private final class AfterSeqChatTransport: @unchecked Sendable, OpenClawChatTran
     private let state = AfterSeqTransportState()
     private let fullResponses: [OpenClawChatHistoryPayload]
     private let deltaResponses: [OpenClawChatHistoryPayload]
+    private let rejectedDeltaCalls: Set<Int>
     private let sendMessageStatus: String
 
     private let stream: AsyncStream<OpenClawChatTransportEvent>
@@ -92,10 +94,12 @@ private final class AfterSeqChatTransport: @unchecked Sendable, OpenClawChatTran
     init(
         fullResponses: [OpenClawChatHistoryPayload],
         deltaResponses: [OpenClawChatHistoryPayload] = [],
+        rejectedDeltaCalls: Set<Int> = [],
         sendMessageStatus: String = "ok")
     {
         self.fullResponses = fullResponses
         self.deltaResponses = deltaResponses
+        self.rejectedDeltaCalls = rejectedDeltaCalls
         self.sendMessageStatus = sendMessageStatus
         var cont: AsyncStream<OpenClawChatTransportEvent>.Continuation!
         self.stream = AsyncStream { c in
@@ -122,6 +126,12 @@ private final class AfterSeqChatTransport: @unchecked Sendable, OpenClawChatTran
 
     func requestHistory(sessionKey _: String, afterSeq: Int) async throws -> OpenClawChatHistoryPayload {
         let idx = await self.state.recordDelta(afterSeq)
+        if self.rejectedDeltaCalls.contains(idx) {
+            throw NSError(
+                domain: "AfterSeqChatTransport",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "afterSeq is not supported"])
+        }
         guard idx < self.deltaResponses.count else {
             throw NSError(
                 domain: "AfterSeqChatTransport",
@@ -320,6 +330,84 @@ struct ChatHistoryAfterSeqTests {
         #expect(await transport.deltaCalls() == [2])
         let texts = await visibleTexts(vm)
         #expect(texts == ["hello", "rewritten"])
+    }
+
+    @Test
+    func rejectedAfterSeqRequestFallsBackToFullFetch() async throws {
+        let bootstrap = fullPayload(messages: [
+            seqMessage(role: "user", text: "hi", timestamp: 1000, seq: 1),
+            seqMessage(role: "assistant", text: "hello", timestamp: 2000, seq: 2),
+        ])
+        let refreshed = fullPayload(messages: [
+            seqMessage(role: "assistant", text: "replacement", timestamp: 3000, seq: 3),
+        ])
+        let transport = AfterSeqChatTransport(
+            fullResponses: [bootstrap, refreshed],
+            rejectedDeltaCalls: [0])
+        let vm = try await makeLoadedViewModel(transport: transport)
+
+        transport.emit(.seqGap)
+        try await waitUntil("fallback full fetch applied") {
+            await visibleTexts(vm) == ["replacement"]
+        }
+
+        #expect(await transport.deltaCalls() == [2])
+        #expect(await transport.fullHistoryCalls().count == 2)
+    }
+
+    @Test
+    func changedSessionIdRebasesFromFullHistory() async throws {
+        let bootstrap = fullPayload(messages: [
+            seqMessage(role: "assistant", text: "old", timestamp: 1000, seq: 2),
+        ])
+        let staleDelta = deltaPayload(
+            sessionId: "sess-replaced",
+            afterSeq: 2,
+            nextAfterSeq: 3,
+            hasMore: false,
+            totalMessages: 1,
+            messages: [seqMessage(role: "assistant", text: "stale", timestamp: 2000, seq: 3)])
+        let replacement = fullPayload(
+            sessionId: "sess-replaced",
+            messages: [seqMessage(role: "assistant", text: "replacement", timestamp: 3000, seq: 1)])
+        let transport = AfterSeqChatTransport(
+            fullResponses: [bootstrap, replacement],
+            deltaResponses: [staleDelta])
+        let vm = try await makeLoadedViewModel(transport: transport)
+
+        transport.emit(.seqGap)
+        try await waitUntil("replacement session rebased") {
+            await visibleTexts(vm) == ["replacement"]
+        }
+
+        #expect(await transport.fullHistoryCalls().count == 2)
+    }
+
+    @Test
+    func backwardCursorRebasesFromFullHistory() async throws {
+        let bootstrap = fullPayload(messages: [
+            seqMessage(role: "assistant", text: "old", timestamp: 1000, seq: 2),
+        ])
+        let backward = deltaPayload(
+            afterSeq: 2,
+            nextAfterSeq: 1,
+            hasMore: false,
+            totalMessages: 1,
+            messages: [seqMessage(role: "assistant", text: "stale", timestamp: 2000, seq: 1)])
+        let replacement = fullPayload(messages: [
+            seqMessage(role: "assistant", text: "replacement", timestamp: 3000, seq: 3),
+        ])
+        let transport = AfterSeqChatTransport(
+            fullResponses: [bootstrap, replacement],
+            deltaResponses: [backward])
+        let vm = try await makeLoadedViewModel(transport: transport)
+
+        transport.emit(.seqGap)
+        try await waitUntil("backward cursor rebased") {
+            await visibleTexts(vm) == ["replacement"]
+        }
+
+        #expect(await transport.fullHistoryCalls().count == 2)
     }
 
     @Test
