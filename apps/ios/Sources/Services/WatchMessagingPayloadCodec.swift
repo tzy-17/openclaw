@@ -13,7 +13,8 @@ enum WatchMessagingPayloadCodec {
 
     static func encodeNotificationPayload(
         id: String,
-        params: OpenClawWatchNotifyParams) -> [String: Any]
+        params: OpenClawWatchNotifyParams,
+        gatewayStableID: String?) -> [String: Any]
     {
         var payload: [String: Any] = [
             "type": OpenClawWatchPayloadType.notify.rawValue,
@@ -28,6 +29,9 @@ enum WatchMessagingPayloadCodec {
         }
         if let sessionKey = nonEmpty(params.sessionKey) {
             payload["sessionKey"] = sessionKey
+        }
+        if let gatewayStableID = nonEmpty(gatewayStableID) {
+            payload["gatewayStableID"] = gatewayStableID
         }
         if let kind = nonEmpty(params.kind) {
             payload["kind"] = kind
@@ -214,6 +218,7 @@ enum WatchMessagingPayloadCodec {
         let replyId = self.nonEmpty(payload["replyId"] as? String) ?? UUID().uuidString
         let actionLabel = self.nonEmpty(payload["actionLabel"] as? String)
         let sessionKey = self.nonEmpty(payload["sessionKey"] as? String)
+        let gatewayStableID = self.nonEmpty(payload["gatewayStableID"] as? String)
         let note = self.nonEmpty(payload["note"] as? String)
         let sentAtMs = (payload["sentAtMs"] as? Int) ?? (payload["sentAtMs"] as? NSNumber)?.intValue
 
@@ -223,6 +228,7 @@ enum WatchMessagingPayloadCodec {
             actionId: actionId,
             actionLabel: actionLabel,
             sessionKey: sessionKey,
+            gatewayStableID: gatewayStableID,
             note: note,
             sentAtMs: sentAtMs,
             transport: transport)

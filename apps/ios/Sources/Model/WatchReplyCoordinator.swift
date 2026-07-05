@@ -1,188 +1,28 @@
 import Foundation
 
 @MainActor
-final class WatchReplyCoordinator {
+final class WatchMessageOutbox {
     enum Decision {
         case dropMissingFields
         case dropMissingTarget
-        case deduped(replyId: String)
-        case queue(replyId: String, actionId: String)
+        case deduped(messageID: String)
+        case queue(messageID: String)
         case forward
     }
 
-    private static let persistedQueueKey = "watch.reply.queue.v1"
-    private static let maxRecentReplyIds = 128
-
-    private struct QueuedReply: Codable, Equatable {
-        var gatewayStableID: String
-        var event: WatchQuickReplyEvent
-    }
-
-    private let defaults: UserDefaults
-    private var queuedReplies: [QueuedReply] = []
-    private var recentReplyKeys: [String] = []
-    private var seenReplyKeys = Set<String>()
-
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-        self.restoreQueue()
-    }
-
-    func ingest(
-        _ event: WatchQuickReplyEvent,
-        isGatewayConnected: Bool,
-        gatewayStableID: String?) -> Decision
-    {
-        let replyId = event.replyId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let actionId = event.actionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if replyId.isEmpty || actionId.isEmpty {
-            return .dropMissingFields
-        }
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let replyKey = self.replyKey(gatewayStableID: owner, replyId: replyId)
-        if self.seenReplyKeys.contains(replyKey) {
-            return .deduped(replyId: replyId)
-        }
-        self.rememberRecentReplyKey(replyKey)
-        if !isGatewayConnected {
-            guard !owner.isEmpty else { return .dropMissingTarget }
-            self.queuedReplies.append(QueuedReply(gatewayStableID: owner, event: event))
-            self.rebuildSeenReplyKeys()
-            self.persistQueue()
-            return .queue(replyId: replyId, actionId: actionId)
-        }
-        return .forward
-    }
-
-    func nextQueuedReply(isGatewayConnected: Bool, gatewayStableID: String?) -> WatchQuickReplyEvent? {
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard isGatewayConnected, !owner.isEmpty else { return nil }
-        return self.queuedReplies.first { $0.gatewayStableID == owner }?.event
-    }
-
-    func removeQueuedReply(replyId: String, gatewayStableID: String?) {
-        let replyId = replyId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !replyId.isEmpty, !owner.isEmpty else { return }
-        guard let index = self.queuedReplies.firstIndex(where: {
-            $0.gatewayStableID == owner && $0.event.replyId.trimmingCharacters(in: .whitespacesAndNewlines) == replyId
-        }) else { return }
-        self.queuedReplies.remove(at: index)
-        self.rememberRecentReplyKey(self.replyKey(gatewayStableID: owner, replyId: replyId))
-        self.persistQueue()
-    }
-
-    func requeueFront(_ event: WatchQuickReplyEvent, gatewayStableID: String?) {
-        let replyId = event.replyId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !owner.isEmpty else { return }
-        if !replyId.isEmpty {
-            self.rememberRecentReplyKey(self.replyKey(gatewayStableID: owner, replyId: replyId))
-            self.queuedReplies.removeAll {
-                $0.gatewayStableID == owner
-                    && $0.event.replyId.trimmingCharacters(in: .whitespacesAndNewlines) == replyId
-            }
-        }
-        self.queuedReplies.insert(QueuedReply(gatewayStableID: owner, event: event), at: 0)
-        self.rebuildSeenReplyKeys()
-        self.persistQueue()
-    }
-
-    var queuedCount: Int {
-        self.queuedReplies.count
-    }
-
-    private func restoreQueue() {
-        guard let data = defaults.data(forKey: Self.persistedQueueKey),
-              let persisted = try? JSONDecoder().decode([QueuedReply].self, from: data)
-        else {
-            return
-        }
-
-        var seen: [String] = []
-        var seenSet = Set<String>()
-        self.queuedReplies = persisted.compactMap { queued in
-            let owner = queued.gatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
-            let replyId = queued.event.replyId.trimmingCharacters(in: .whitespacesAndNewlines)
-            let actionId = queued.event.actionId.trimmingCharacters(in: .whitespacesAndNewlines)
-            let replyKey = self.replyKey(gatewayStableID: owner, replyId: replyId)
-            guard !owner.isEmpty, !replyId.isEmpty, !actionId.isEmpty, seenSet.insert(replyKey).inserted else {
-                return nil
-            }
-            seen.append(replyKey)
-            var restored = queued.event
-            restored.replyId = replyId
-            restored.actionId = actionId
-            return QueuedReply(gatewayStableID: owner, event: restored)
-        }
-        self.recentReplyKeys = Array(seen.suffix(Self.maxRecentReplyIds))
-        self.rebuildSeenReplyKeys()
-        if self.queuedReplies.count != persisted.count {
-            self.persistQueue()
-        }
-    }
-
-    private func rememberRecentReplyKey(_ replyKey: String) {
-        guard !replyKey.isEmpty else { return }
-        self.recentReplyKeys.removeAll { $0 == replyKey }
-        self.recentReplyKeys.append(replyKey)
-        if self.recentReplyKeys.count > Self.maxRecentReplyIds {
-            self.recentReplyKeys.removeFirst(self.recentReplyKeys.count - Self.maxRecentReplyIds)
-        }
-        self.rebuildSeenReplyKeys()
-    }
-
-    private func rebuildSeenReplyKeys() {
-        var ids = Set(self.recentReplyKeys)
-        ids.formUnion(
-            self.queuedReplies.map {
-                self.replyKey(gatewayStableID: $0.gatewayStableID, replyId: $0.event.replyId)
-            })
-        self.seenReplyKeys = ids
-    }
-
-    private func persistQueue() {
-        if self.queuedReplies.isEmpty {
-            self.defaults.removeObject(forKey: Self.persistedQueueKey)
-            return
-        }
-        guard let data = try? JSONEncoder().encode(self.queuedReplies) else { return }
-        self.defaults.set(data, forKey: Self.persistedQueueKey)
-    }
-
-    private func replyKey(gatewayStableID: String, replyId: String) -> String {
-        let owner = gatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
-        let replyId = replyId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return owner.isEmpty ? replyId : "\(owner):\(replyId)"
-    }
-
-    static func resetPersistedQueue(defaults: UserDefaults = .standard) {
-        defaults.removeObject(forKey: self.persistedQueueKey)
-    }
-}
-
-@MainActor
-final class WatchChatCoordinator {
-    enum Decision {
-        case dropMissingFields
-        case dropMissingTarget
-        case deduped(commandId: String)
-        case queue(commandId: String)
-        case forward
-    }
-
+    // Keep the shipped chat key so upgrades retain messages already queued by the Watch.
     private static let persistedQueueKey = "watch.chat.command.queue.v1"
-    private static let maxRecentCommandIds = 128
+    private static let maxRecentMessageIDs = 128
 
-    private struct QueuedCommand: Codable, Equatable {
+    private struct QueuedMessage: Codable, Equatable {
         var gatewayStableID: String
         var event: WatchAppCommandEvent
     }
 
     private let defaults: UserDefaults
-    private var queuedCommands: [QueuedCommand] = []
-    private var recentCommandIds: [String] = []
-    private var seenCommandIds = Set<String>()
+    private var queuedMessages: [QueuedMessage] = []
+    private var recentMessageIDs: [String] = []
+    private var seenMessageIDs = Set<String>()
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -191,126 +31,136 @@ final class WatchChatCoordinator {
 
     func ingest(
         _ event: WatchAppCommandEvent,
-        isChatAvailable: Bool,
+        isAvailable: Bool,
         gatewayStableID: String?) -> Decision
     {
-        let commandId = event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let messageID = event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if commandId.isEmpty || text.isEmpty {
+        if messageID.isEmpty || text.isEmpty {
             return .dropMissingFields
         }
-        if self.seenCommandIds.contains(commandId) {
-            return .deduped(commandId: commandId)
+        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !owner.isEmpty else { return .dropMissingTarget }
+        if self.seenMessageIDs.contains(messageID) {
+            return .deduped(messageID: messageID)
         }
-        self.rememberRecentCommandId(commandId)
-        if !isChatAvailable {
-            let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !owner.isEmpty else { return .dropMissingTarget }
-            self.queuedCommands.append(
-                QueuedCommand(gatewayStableID: owner, event: self.command(event, taggedFor: owner)))
-            self.rebuildSeenCommandIds()
-            self.persistQueue()
-            return .queue(commandId: commandId)
-        }
-        return .forward
+        self.rememberRecentMessageID(messageID)
+        // Persist before network delivery; iOS may suspend a background callback at any await.
+        self.queuedMessages.append(
+            QueuedMessage(gatewayStableID: owner, event: self.message(event, taggedFor: owner)))
+        self.rebuildSeenMessageIDs()
+        self.persistQueue()
+        return isAvailable ? .forward : .queue(messageID: messageID)
     }
 
-    func nextQueuedCommand(isChatAvailable: Bool, gatewayStableID: String?) -> WatchAppCommandEvent? {
+    func nextQueuedMessage(isAvailable: Bool, gatewayStableID: String?) -> WatchAppCommandEvent? {
         let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard isChatAvailable, !owner.isEmpty else { return nil }
-        return self.queuedCommands.first { $0.gatewayStableID == owner }?.event
+        guard isAvailable, !owner.isEmpty else { return nil }
+        // Replies are time-sensitive; a retrying chat must not strand them behind it.
+        if let reply = self.queuedMessages.first(where: {
+            $0.gatewayStableID == owner && self.kind(of: $0.event) == .quickReply
+        }) {
+            return reply.event
+        }
+        return self.queuedMessages.first { $0.gatewayStableID == owner }?.event
     }
 
-    func removeQueuedCommand(commandId: String, gatewayStableID: String?) {
-        let commandId = commandId.trimmingCharacters(in: .whitespacesAndNewlines)
+    func removeQueuedMessage(messageID: String, gatewayStableID: String?) {
+        let messageID = messageID.trimmingCharacters(in: .whitespacesAndNewlines)
         let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !commandId.isEmpty, !owner.isEmpty else { return }
-        guard let index = self.queuedCommands.firstIndex(where: {
-            $0.gatewayStableID == owner && $0.event.commandId == commandId
+        guard !messageID.isEmpty, !owner.isEmpty else { return }
+        guard let index = self.queuedMessages.firstIndex(where: {
+            $0.gatewayStableID == owner && $0.event.commandId == messageID
         }) else { return }
-        self.queuedCommands.remove(at: index)
-        self.rememberRecentCommandId(commandId)
+        self.queuedMessages.remove(at: index)
+        self.rememberRecentMessageID(messageID)
         self.persistQueue()
     }
 
     func requeueFront(_ event: WatchAppCommandEvent, gatewayStableID: String?) {
-        let commandId = event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let messageID = event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
         let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !owner.isEmpty else { return }
-        if !commandId.isEmpty {
-            self.rememberRecentCommandId(commandId)
-            self.queuedCommands.removeAll { $0.event.commandId == commandId }
-        }
-        self.queuedCommands.insert(
-            QueuedCommand(gatewayStableID: owner, event: self.command(event, taggedFor: owner)),
+        guard !messageID.isEmpty, !owner.isEmpty else { return }
+        self.rememberRecentMessageID(messageID)
+        self.queuedMessages.removeAll { $0.event.commandId == messageID }
+        self.queuedMessages.insert(
+            QueuedMessage(gatewayStableID: owner, event: self.message(event, taggedFor: owner)),
             at: 0)
-        self.rebuildSeenCommandIds()
+        self.rebuildSeenMessageIDs()
         self.persistQueue()
     }
 
-    var queuedCount: Int {
-        self.queuedCommands.count
+    func queuedCount(kind: WatchMessageKind? = nil) -> Int {
+        guard let kind else { return self.queuedMessages.count }
+        return self.queuedMessages.count(where: { self.kind(of: $0.event) == kind })
     }
 
-    var queuedCommandIds: [String] {
-        self.queuedCommands.map(\.event.commandId)
+    func queuedMessageIDs(kind: WatchMessageKind? = nil) -> [String] {
+        self.queuedMessages.compactMap { queued in
+            guard kind == nil || self.kind(of: queued.event) == kind else { return nil }
+            return queued.event.commandId
+        }
     }
 
     private func restoreQueue() {
         guard let data = defaults.data(forKey: Self.persistedQueueKey),
-              let persisted = try? JSONDecoder().decode([QueuedCommand].self, from: data)
+              let persisted = try? JSONDecoder().decode([QueuedMessage].self, from: data)
         else {
             return
         }
 
         var seen: [String] = []
         var seenSet = Set<String>()
-        self.queuedCommands = persisted.compactMap { queued in
+        self.queuedMessages = persisted.compactMap { queued in
             let owner = queued.gatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
-            let commandId = queued.event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let messageID = queued.event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
             let text = queued.event.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !owner.isEmpty, !commandId.isEmpty, !text.isEmpty, seenSet.insert(commandId).inserted else {
+            guard !owner.isEmpty, !messageID.isEmpty, !text.isEmpty, seenSet.insert(messageID).inserted else {
                 return nil
             }
-            seen.append(commandId)
-            return QueuedCommand(gatewayStableID: owner, event: self.command(queued.event, taggedFor: owner))
+            seen.append(messageID)
+            return QueuedMessage(gatewayStableID: owner, event: self.message(queued.event, taggedFor: owner))
         }
-        self.recentCommandIds = Array(seen.suffix(Self.maxRecentCommandIds))
-        self.rebuildSeenCommandIds()
-        if self.queuedCommands.count != persisted.count {
+        self.recentMessageIDs = Array(seen.suffix(Self.maxRecentMessageIDs))
+        self.rebuildSeenMessageIDs()
+        if self.queuedMessages.count != persisted.count {
             self.persistQueue()
         }
     }
 
-    private func rememberRecentCommandId(_ commandId: String) {
-        guard !commandId.isEmpty else { return }
-        self.recentCommandIds.removeAll { $0 == commandId }
-        self.recentCommandIds.append(commandId)
-        if self.recentCommandIds.count > Self.maxRecentCommandIds {
-            self.recentCommandIds.removeFirst(self.recentCommandIds.count - Self.maxRecentCommandIds)
+    private func rememberRecentMessageID(_ messageID: String) {
+        guard !messageID.isEmpty else { return }
+        self.recentMessageIDs.removeAll { $0 == messageID }
+        self.recentMessageIDs.append(messageID)
+        if self.recentMessageIDs.count > Self.maxRecentMessageIDs {
+            self.recentMessageIDs.removeFirst(self.recentMessageIDs.count - Self.maxRecentMessageIDs)
         }
-        self.rebuildSeenCommandIds()
+        self.rebuildSeenMessageIDs()
     }
 
-    private func rebuildSeenCommandIds() {
-        var ids = Set(self.recentCommandIds)
-        ids.formUnion(self.queuedCommands.map(\.event.commandId))
-        self.seenCommandIds = ids
+    private func rebuildSeenMessageIDs() {
+        var ids = Set(self.recentMessageIDs)
+        ids.formUnion(self.queuedMessages.map(\.event.commandId))
+        self.seenMessageIDs = ids
     }
 
     private func persistQueue() {
-        if self.queuedCommands.isEmpty {
+        if self.queuedMessages.isEmpty {
             self.defaults.removeObject(forKey: Self.persistedQueueKey)
             return
         }
-        guard let data = try? JSONEncoder().encode(queuedCommands) else { return }
+        guard let data = try? JSONEncoder().encode(self.queuedMessages) else { return }
         self.defaults.set(data, forKey: Self.persistedQueueKey)
     }
 
-    private func command(_ event: WatchAppCommandEvent, taggedFor gatewayStableID: String) -> WatchAppCommandEvent {
+    private func message(_ event: WatchAppCommandEvent, taggedFor gatewayStableID: String) -> WatchAppCommandEvent {
         var tagged = event
         tagged.gatewayStableID = gatewayStableID
         return tagged
+    }
+
+    private func kind(of event: WatchAppCommandEvent) -> WatchMessageKind {
+        event.messageKind ?? .chat
     }
 
     static func resetPersistedQueue(defaults: UserDefaults = .standard) {

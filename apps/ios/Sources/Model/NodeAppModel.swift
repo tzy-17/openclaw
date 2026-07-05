@@ -70,6 +70,7 @@ private enum IOSDeepLinkAgentPolicy {
 // swiftlint:disable type_body_length file_length
 final class NodeAppModel {
     private nonisolated static let watchChatPreviewItemLimit = 5
+    private nonisolated static let watchMessageMaxImmediateRetryAttempts = 3
 
     struct AgentDeepLinkPrompt: Identifiable, Equatable {
         let id: String
@@ -103,6 +104,12 @@ final class NodeAppModel {
         case stale
         case unavailable
         case failed(message: String)
+    }
+
+    private enum WatchMessageSendOutcome {
+        case sent
+        case retry
+        case discard
     }
 
     private struct PersistedWatchExecApprovalBridgeState: Codable {
@@ -225,8 +232,10 @@ final class NodeAppModel {
     private var backgroundReconnectLeaseUntil: Date?
     @ObservationIgnored private var foregroundGatewayResumeCheckInFlight = false
     private var lastSignificantLocationWakeAt: Date?
-    @ObservationIgnored private let watchReplyCoordinator = WatchReplyCoordinator()
-    @ObservationIgnored private let watchChatCoordinator = WatchChatCoordinator()
+    @ObservationIgnored private let watchMessageOutbox = WatchMessageOutbox()
+    @ObservationIgnored private var watchMessageFlushInFlight = false
+    @ObservationIgnored private var watchMessageRetryAttempts: [String: Int] = [:]
+    @ObservationIgnored private var watchMessageRetryTask: Task<Void, Never>?
     @ObservationIgnored private let appleReviewDemoChatTransport = AppleReviewDemoChatTransport()
     private var watchExecApprovalPromptsByID: [String: ExecApprovalPrompt] = [:]
     private var pendingWatchExecApprovalRecoveryIDs: [String] = []
@@ -1890,15 +1899,18 @@ extension NodeAppModel {
                         message: "INVALID_REQUEST: empty watch notification"))
             }
             do {
+                let gatewayStableID = self.currentWatchChatGatewayStableID()
                 let result = try await self.watchMessagingService.sendNotification(
                     id: req.id,
-                    params: normalizedParams)
+                    params: normalizedParams,
+                    gatewayStableID: gatewayStableID)
                 if result.queuedForDelivery || !result.deliveredImmediately {
                     let invokeID = req.id
                     Task { @MainActor in
                         await WatchPromptNotificationBridge.scheduleMirroredWatchPromptNotificationIfNeeded(
                             invokeID: invokeID,
                             params: normalizedParams,
+                            gatewayStableID: gatewayStableID,
                             sendResult: result)
                     }
                 }
@@ -2957,7 +2969,7 @@ extension NodeAppModel {
             return
         }
         Task { [weak self] in
-            await self?.flushQueuedWatchChatsIfAvailable()
+            await self?.flushQueuedWatchMessagesIfAvailable()
             guard changed else { return }
             await self?.syncWatchAppSnapshot(reason: "operator_online")
         }
@@ -3166,7 +3178,6 @@ extension NodeAppModel {
     /// Back-compat hook retained for older gateway-connect flows.
     func onNodeGatewayConnected() async {
         await self.registerAPNsTokenIfNeeded()
-        await self.flushQueuedWatchRepliesIfConnected()
         await self.syncWatchAppSnapshot(reason: "node_connected", includeChat: true)
         await self.syncWatchExecApprovalSnapshot(reason: "node_connected")
         await self.resumePendingForegroundNodeActionsIfNeeded(trigger: "node_connected")
@@ -3249,72 +3260,52 @@ extension NodeAppModel {
     }
 
     private func handleWatchQuickReply(_ event: WatchQuickReplyEvent) async {
-        let gatewayStableID = self.currentWatchReplyGatewayStableID()
-        switch await self.watchReplyCoordinator.ingest(
-            event,
-            isGatewayConnected: self.isGatewayConnected(),
-            gatewayStableID: gatewayStableID)
-        {
-        case .dropMissingFields:
+        let replyID = event.replyId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let actionID = event.actionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !replyID.isEmpty, !actionID.isEmpty else {
             self.watchReplyLogger.info("watch reply dropped: missing replyId/actionId")
-        case .dropMissingTarget:
-            self.watchReplyLogger.info("watch reply dropped: missing gateway target")
-        case let .deduped(replyId):
-            self.watchReplyLogger.debug(
-                "watch reply deduped replyId=\(replyId, privacy: .public)")
-        case let .queue(replyId, actionId):
-            self.watchReplyLogger.info(
-                "watch reply queued replyId=\(replyId, privacy: .public) action=\(actionId, privacy: .public)")
-        case .forward:
-            _ = await self.forwardWatchReplyToAgent(event)
+            return
         }
-    }
-
-    private func flushQueuedWatchRepliesIfConnected() async {
-        let gatewayStableID = self.currentWatchReplyGatewayStableID()
-        while let event = await self.watchReplyCoordinator.nextQueuedReply(
-            isGatewayConnected: self.isGatewayConnected(),
-            gatewayStableID: gatewayStableID)
-        {
-            let forwarded = await self.forwardWatchReplyToAgent(event)
-            guard forwarded else { return }
-            self.watchReplyCoordinator.removeQueuedReply(replyId: event.replyId, gatewayStableID: gatewayStableID)
+        let sourceGatewayID = event.gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentGatewayID = self.currentWatchChatGatewayStableID()
+        if !sourceGatewayID.isEmpty, let currentGatewayID, currentGatewayID != sourceGatewayID {
+            self.watchReplyLogger.info("watch reply dropped: stale gateway target")
+            return
         }
-    }
-
-    private func currentWatchReplyGatewayStableID() -> String? {
-        self.connectedGatewayID?.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func forwardWatchReplyToAgent(_ event: WatchQuickReplyEvent) async -> Bool {
-        let sessionKey = event.sessionKey?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveSessionKey = (sessionKey?.isEmpty == false) ? sessionKey : self.mainSessionKey
-        let message = Self.makeWatchReplyAgentMessage(event)
-        let link = AgentDeepLink(
-            message: message,
-            sessionKey: effectiveSessionKey,
-            thinking: "low",
-            deliver: false,
-            to: nil,
-            channel: nil,
-            timeoutSeconds: nil,
-            key: event.replyId)
-        do {
-            try await self.sendAgentRequest(link: link)
-            let forwardedMessage =
-                "watch reply forwarded replyId=\(event.replyId) "
-                    + "action=\(event.actionId)"
-            self.watchReplyLogger.info("\(forwardedMessage, privacy: .public)")
-            self.openChatRequestID &+= 1
-            return true
-        } catch {
-            let failedMessage =
-                "watch reply forwarding failed replyId=\(event.replyId) "
-                    + "error=\(error.localizedDescription)"
-            self.watchReplyLogger.error("\(failedMessage, privacy: .public)")
-            self.watchReplyCoordinator.requeueFront(event, gatewayStableID: self.currentWatchReplyGatewayStableID())
-            return false
+        let gatewayStableID: String
+        if !sourceGatewayID.isEmpty {
+            gatewayStableID = sourceGatewayID
+        } else {
+            // Released Watch builds omit the source gateway. During version skew, bind
+            // the reply to the current gateway before it enters the durable outbox.
+            guard let currentGatewayID else {
+                self.watchReplyLogger.info("watch reply dropped: missing gateway target")
+                return
+            }
+            gatewayStableID = currentGatewayID
         }
+
+        let message = WatchAppCommandEvent(
+            commandId: replyID,
+            command: .sendChat,
+            sessionKey: event.sessionKey,
+            gatewayStableID: gatewayStableID,
+            text: Self.makeWatchReplyAgentMessage(event),
+            sentAtMs: event.sentAtMs,
+            transport: event.transport,
+            messageKind: .quickReply)
+        let needsReconnect = !self.isWatchMessageSendAvailable()
+        await self.handleWatchMessage(message)
+        guard needsReconnect else { return }
+
+        let connected = await self.ensureOperatorApprovalConnectionForWatchReview(
+            timeoutMs: 12000,
+            reason: "watch_reply")
+        guard connected, self.currentWatchChatGatewayStableID() == gatewayStableID else {
+            self.watchReplyLogger.info("watch reply remains queued: gateway target unavailable")
+            return
+        }
+        await self.flushQueuedWatchMessagesIfAvailable()
     }
 
     private static func makeWatchReplyAgentMessage(_ event: WatchQuickReplyEvent) -> String {
@@ -3730,53 +3721,92 @@ extension NodeAppModel {
     }
 
     private func handleWatchChatCommand(_ event: WatchAppCommandEvent) async {
-        guard self.watchChatCommandTargetsCurrentGateway(event) else {
+        guard self.watchMessageTargetsCurrentGateway(event) else {
             GatewayDiagnostics.log("watch chat send skipped: stale gateway target")
             await self.syncWatchAppSnapshot(reason: "watch_chat_stale_gateway", includeChat: true)
             return
         }
-        let eventGatewayID = self.normalizedWatchChatGatewayStableID(event)
-        switch self.watchChatCoordinator.ingest(
+        await self.handleWatchMessage(event)
+    }
+
+    private func handleWatchMessage(_ event: WatchAppCommandEvent) async {
+        let eventGatewayID = self.normalizedWatchMessageGatewayStableID(event)
+        let isAvailable = self.isWatchMessageSendAvailable()
+        if isAvailable, !self.watchMessageTargetsCurrentGateway(event) {
+            GatewayDiagnostics.log("watch message send skipped: stale gateway target")
+            return
+        }
+        switch self.watchMessageOutbox.ingest(
             event,
-            isChatAvailable: self.isWatchChatAvailableForSend(),
+            isAvailable: isAvailable,
             gatewayStableID: eventGatewayID)
         {
         case .dropMissingFields:
-            GatewayDiagnostics.log("watch chat send skipped: missing commandId/text")
+            GatewayDiagnostics.log("watch message send skipped: missing id/text")
         case .dropMissingTarget:
-            GatewayDiagnostics.log("watch chat send skipped: missing gateway target")
-        case let .deduped(commandId):
-            GatewayDiagnostics.log("watch chat send deduped commandId=\(commandId)")
-        case let .queue(commandId):
-            GatewayDiagnostics.log("watch chat send queued commandId=\(commandId)")
-            await self.syncWatchAppSnapshot(reason: "watch_chat_queued", includeChat: true)
-        case .forward:
-            _ = await self.forwardWatchChatMessage(event, requeueOnFailure: true)
-        }
-    }
-
-    private func flushQueuedWatchChatsIfAvailable() async {
-        let gatewayStableID = self.currentWatchChatGatewayStableID()
-        while let event = self.watchChatCoordinator.nextQueuedCommand(
-            isChatAvailable: self.isWatchChatAvailableForSend(),
-            gatewayStableID: gatewayStableID)
-        {
-            guard self.watchChatCommandTargetsCurrentGateway(event) else {
-                GatewayDiagnostics.log("watch chat send skipped: stale queued gateway target")
-                self.watchChatCoordinator.removeQueuedCommand(
-                    commandId: event.commandId,
-                    gatewayStableID: gatewayStableID)
-                continue
+            GatewayDiagnostics.log("watch message send skipped: missing gateway target")
+        case let .deduped(messageID):
+            GatewayDiagnostics.log("watch message send deduped id=\(messageID)")
+        case let .queue(messageID):
+            GatewayDiagnostics.log("watch message send queued id=\(messageID)")
+            if self.watchMessageKind(event) == .chat {
+                await self.syncWatchAppSnapshot(reason: "watch_chat_queued", includeChat: true)
             }
-            let sent = await self.forwardWatchChatMessage(event, requeueOnFailure: false)
-            guard sent else { return }
-            self.watchChatCoordinator.removeQueuedCommand(
-                commandId: event.commandId,
-                gatewayStableID: gatewayStableID)
+        case .forward:
+            switch await self.forwardWatchMessage(event, requeueOnFailure: true) {
+            case .sent, .discard:
+                self.watchMessageOutbox.removeQueuedMessage(
+                    messageID: event.commandId,
+                    gatewayStableID: eventGatewayID)
+                self.watchMessageRetryAttempts[event.commandId] = nil
+            case .retry:
+                self.scheduleWatchMessageRetry(messageID: event.commandId)
+            }
         }
     }
 
-    private func isWatchChatAvailableForSend() -> Bool {
+    private func flushQueuedWatchMessagesIfAvailable() async {
+        guard !self.watchMessageFlushInFlight else { return }
+        self.watchMessageFlushInFlight = true
+        defer { self.watchMessageFlushInFlight = false }
+        guard let gatewayStableID = self.currentWatchChatGatewayStableID() else { return }
+        while self.currentWatchChatGatewayStableID() == gatewayStableID {
+            guard let event = self.watchMessageOutbox.nextQueuedMessage(
+                isAvailable: self.isWatchMessageSendAvailable(),
+                gatewayStableID: gatewayStableID)
+            else { return }
+            guard self.watchMessageTargetsCurrentGateway(event) else { return }
+            switch await self.forwardWatchMessage(event, requeueOnFailure: false) {
+            case .sent, .discard:
+                self.watchMessageOutbox.removeQueuedMessage(
+                    messageID: event.commandId,
+                    gatewayStableID: gatewayStableID)
+                self.watchMessageRetryAttempts[event.commandId] = nil
+            case .retry:
+                self.scheduleWatchMessageRetry(messageID: event.commandId)
+                return
+            }
+        }
+    }
+
+    private func scheduleWatchMessageRetry(messageID: String) {
+        guard self.isWatchMessageSendAvailable(), self.watchMessageRetryTask == nil else { return }
+        let attempt = (self.watchMessageRetryAttempts[messageID] ?? 0) + 1
+        guard attempt <= Self.watchMessageMaxImmediateRetryAttempts else {
+            GatewayDiagnostics.log("watch message retry deferred until reconnect id=\(messageID)")
+            return
+        }
+        self.watchMessageRetryAttempts[messageID] = attempt
+        let delayNanoseconds = UInt64(500 * (1 << (attempt - 1))) * 1_000_000
+        self.watchMessageRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard let self else { return }
+            self.watchMessageRetryTask = nil
+            await self.flushQueuedWatchMessagesIfAvailable()
+        }
+    }
+
+    private func isWatchMessageSendAvailable() -> Bool {
         self.isAppleReviewDemoModeEnabled || self.isOperatorGatewayConnected
     }
 
@@ -3784,78 +3814,115 @@ extension NodeAppModel {
         self.connectedGatewayID?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func normalizedWatchChatGatewayStableID(_ event: WatchAppCommandEvent) -> String? {
+    private func normalizedWatchMessageGatewayStableID(_ event: WatchAppCommandEvent) -> String? {
         let gatewayStableID = event.gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return gatewayStableID.isEmpty ? nil : gatewayStableID
     }
 
-    private func watchChatCommandTargetsCurrentGateway(_ event: WatchAppCommandEvent) -> Bool {
-        let eventGatewayID = self.normalizedWatchChatGatewayStableID(event) ?? ""
+    private func watchMessageTargetsCurrentGateway(_ event: WatchAppCommandEvent) -> Bool {
+        let eventGatewayID = self.normalizedWatchMessageGatewayStableID(event) ?? ""
         let currentGatewayID = self.currentWatchChatGatewayStableID() ?? ""
         guard !eventGatewayID.isEmpty, !currentGatewayID.isEmpty else { return false }
         return eventGatewayID == currentGatewayID
     }
 
-    private func forwardWatchChatMessage(
+    private func watchMessageKind(_ event: WatchAppCommandEvent) -> WatchMessageKind {
+        event.messageKind ?? .chat
+    }
+
+    private func forwardWatchMessage(
         _ event: WatchAppCommandEvent,
-        requeueOnFailure: Bool) async -> Bool
+        requeueOnFailure: Bool) async -> WatchMessageSendOutcome
     {
+        guard self.watchMessageTargetsCurrentGateway(event) else {
+            GatewayDiagnostics.log("watch message send skipped: stale gateway target")
+            return .retry
+        }
         let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !text.isEmpty else {
             GatewayDiagnostics.log("watch chat send skipped: empty text")
-            return true
+            return .discard
         }
 
+        let messageKind = self.watchMessageKind(event)
+        let fallbackSessionKey = messageKind == .quickReply ? self.mainSessionKey : self.chatSessionKey
         let sessionKey = (event.sessionKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             ? event.sessionKey!
-            : self.chatSessionKey
-        self.focusChatSession(sessionKey)
+            : fallbackSessionKey
+        if messageKind == .chat {
+            self.focusChatSession(sessionKey)
+        }
+        let thinking = messageKind == .quickReply ? "low" : "auto"
 
         do {
             if self.isAppleReviewDemoModeEnabled {
                 _ = try await self.appleReviewDemoChatTransport.sendMessage(
                     sessionKey: sessionKey,
                     message: text,
-                    thinking: "auto",
+                    thinking: thinking,
                     idempotencyKey: event.commandId,
                     attachments: [])
-                await self.syncWatchAppSnapshot(reason: "watch_chat_sent", includeChat: true)
-                return true
+                await self.finishForwardedWatchMessage(event)
+                return .sent
             }
 
             guard self.isOperatorGatewayConnected else {
                 GatewayDiagnostics.log("watch chat send skipped: operator gateway disconnected")
                 if requeueOnFailure {
-                    self.watchChatCoordinator.requeueFront(
+                    self.watchMessageOutbox.requeueFront(
                         event,
-                        gatewayStableID: self.normalizedWatchChatGatewayStableID(event))
+                        gatewayStableID: self.normalizedWatchMessageGatewayStableID(event))
                 }
-                return false
+                return .retry
             }
 
             let transport = IOSGatewayChatTransport(gateway: self.operatorSession)
             let response = try await transport.sendMessage(
                 sessionKey: sessionKey,
                 message: text,
-                thinking: "auto",
+                thinking: thinking,
                 idempotencyKey: event.commandId,
                 attachments: [])
+            if messageKind == .quickReply {
+                await self.finishForwardedWatchMessage(event)
+                return .sent
+            }
             await self.syncWatchAppSnapshot(reason: "watch_chat_sent", includeChat: true)
             let completed = await transport.waitForRunCompletion(
                 runId: response.runId,
                 timeoutMs: Self.watchChatCompletionWaitMs)
-            guard completed else { return true }
+            guard completed else { return .sent }
             await self.syncWatchAppSnapshot(reason: "watch_chat_completed", includeChat: true)
-            return true
+            return .sent
         } catch {
             GatewayDiagnostics.log("watch chat send failed error=\(error.localizedDescription)")
-            if requeueOnFailure {
-                self.watchChatCoordinator.requeueFront(
-                    event,
-                    gatewayStableID: self.normalizedWatchChatGatewayStableID(event))
+            if Self.shouldDiscardFailedWatchMessage(error) {
+                GatewayDiagnostics.log("watch message discarded after permanent send failure id=\(event.commandId)")
+                return .discard
             }
-            return false
+            if requeueOnFailure {
+                self.watchMessageOutbox.requeueFront(
+                    event,
+                    gatewayStableID: self.normalizedWatchMessageGatewayStableID(event))
+            }
+            return .retry
         }
+    }
+
+    private nonisolated static func shouldDiscardFailedWatchMessage(_ error: Error) -> Bool {
+        guard let gatewayError = error as? GatewayResponseError else { return false }
+        guard gatewayError.code == "INVALID_REQUEST" else { return false }
+        return !gatewayError.message.lowercased().hasSuffix("retry.")
+    }
+
+    private func finishForwardedWatchMessage(_ event: WatchAppCommandEvent) async {
+        if self.watchMessageKind(event) == .chat {
+            await self.syncWatchAppSnapshot(reason: "watch_chat_sent", includeChat: true)
+            return
+        }
+        self.watchReplyLogger.info(
+            "watch reply forwarded replyId=\(event.commandId, privacy: .public)")
+        self.openChatRequestID &+= 1
     }
 
     private func syncWatchAppSnapshot(reason: String, includeChat: Bool = false) async {
@@ -5210,15 +5277,15 @@ extension NodeAppModel {
     }
 
     func _test_queuedWatchReplyCount() -> Int {
-        self.watchReplyCoordinator.queuedCount
+        self.watchMessageOutbox.queuedCount(kind: .quickReply)
     }
 
     func _test_queuedWatchChatCommandCount() -> Int {
-        self.watchChatCoordinator.queuedCount
+        self.watchMessageOutbox.queuedCount(kind: .chat)
     }
 
     func _test_queuedWatchChatCommandIds() -> [String] {
-        self.watchChatCoordinator.queuedCommandIds
+        self.watchMessageOutbox.queuedMessageIDs(kind: .chat)
     }
 
     func _test_setConnectedGatewayID(_ gatewayID: String?) {
@@ -5230,11 +5297,11 @@ extension NodeAppModel {
     }
 
     static func _test_resetPersistedWatchChatQueueState() {
-        WatchChatCoordinator.resetPersistedQueue()
+        WatchMessageOutbox.resetPersistedQueue()
     }
 
     static func _test_resetPersistedWatchReplyQueueState() {
-        WatchReplyCoordinator.resetPersistedQueue()
+        WatchMessageOutbox.resetPersistedQueue()
     }
 
     func _test_setGatewayConnected(_ connected: Bool) {
@@ -5402,6 +5469,14 @@ extension NodeAppModel {
 
     static func _test_currentDeepLinkKey() -> String {
         self.expectedDeepLinkKey()
+    }
+
+    nonisolated static func _test_shouldDiscardFailedWatchMessage(
+        code: String,
+        message: String = "test") -> Bool
+    {
+        self.shouldDiscardFailedWatchMessage(
+            GatewayResponseError(method: "chat.send", code: code, message: message, details: nil))
     }
 
     static func _test_resetPersistedWatchExecApprovalBridgeState() {

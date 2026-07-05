@@ -147,6 +147,7 @@ struct WatchNotifyMessage {
     var sentAtMs: Int?
     var promptId: String?
     var sessionKey: String?
+    var gatewayStableID: String?
     var kind: String?
     var details: String?
     var expiresAtMs: Int?
@@ -177,6 +178,7 @@ struct WatchExecApprovalRecord: Codable, Equatable, Identifiable {
         var lastDeliveryKey: String?
         var promptId: String?
         var sessionKey: String?
+        var gatewayStableID: String?
         var kind: String?
         var details: String?
         var expiresAtMs: Int?
@@ -206,6 +208,7 @@ struct WatchExecApprovalRecord: Codable, Equatable, Identifiable {
     var updatedAt: Date?
     var promptId: String?
     var sessionKey: String?
+    var gatewayStableID: String?
     var kind: String?
     var details: String?
     var expiresAtMs: Int?
@@ -353,6 +356,7 @@ struct WatchExecApprovalRecord: Codable, Equatable, Identifiable {
         self.updatedAt = Date()
         self.promptId = message.promptId
         self.sessionKey = message.sessionKey
+        self.gatewayStableID = message.gatewayStableID
         self.kind = message.kind
         self.details = message.details
         self.expiresAtMs = message.expiresAtMs
@@ -664,6 +668,7 @@ struct WatchExecApprovalRecord: Codable, Equatable, Identifiable {
         self.lastDeliveryKey = state.lastDeliveryKey
         self.promptId = state.promptId
         self.sessionKey = state.sessionKey
+        self.gatewayStableID = state.gatewayStableID
         self.kind = state.kind
         self.details = state.details
         self.expiresAtMs = state.expiresAtMs
@@ -692,6 +697,7 @@ struct WatchExecApprovalRecord: Codable, Equatable, Identifiable {
             lastDeliveryKey: lastDeliveryKey,
             promptId: promptId,
             sessionKey: sessionKey,
+            gatewayStableID: gatewayStableID,
             kind: kind,
             details: details,
             expiresAtMs: expiresAtMs,
@@ -749,6 +755,7 @@ struct WatchExecApprovalRecord: Codable, Equatable, Identifiable {
             actionId: action.id,
             actionLabel: action.label,
             sessionKey: self.sessionKey,
+            gatewayStableID: self.gatewayStableID,
             note: nil,
             sentAtMs: Self.nowMs())
     }
