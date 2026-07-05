@@ -80,6 +80,11 @@ public final class OpenClawChatViewModel {
     // Failed later refreshes must not drop the last successful pending-run history payload.
     private var lastIssuedHistoryRequestID: UInt64 = 0
     private var latestAppliedHistoryRequestID: UInt64 = 0
+    // Highest transcript seq (`__openclaw.seq`) applied from chat.history for the
+    // current session; reconnect catch-up fetches only rows after it. Push events
+    // never advance it: after a detected seq gap the missed rows must still fall
+    // inside the next afterSeq delta fetch.
+    private var lastAppliedTranscriptSeq: Int?
 
     @ObservationIgnored
     private nonisolated(unsafe) var pendingRunTimeoutTasks: [String: Task<Void, Never>] = [:]
@@ -459,6 +464,9 @@ public final class OpenClawChatViewModel {
             Self.reconcileMessageIDs(previous: self.messages, incoming: incoming)
         }
         self.replaceMessages(nextMessages)
+        // Full pages rebase the catch-up cursor onto the newest delivered row.
+        // Older gateways omit seq metadata, leaving nil and full refetches.
+        self.lastAppliedTranscriptSeq = incoming.compactMap(\.transcriptSeq).max()
         self.prunePendingLocalUserEchoMessageIDs()
         self.clearProvisionalFinalMarkersAdoptedByHistory(incoming)
         self.pruneProvisionalFinalMessages()
@@ -486,6 +494,80 @@ public final class OpenClawChatViewModel {
         return true
     }
 
+    // Appends a catch-up page through the same reconcile/dedupe path used for
+    // pushed session rows; idempotency-keyed adoption and dedupe absorb overlap
+    // from lossless re-delivery of budget-trimmed rows.
+    private func appendHistoryDeltaPage(
+        _ payload: OpenClawChatHistoryPayload,
+        for request: HistoryRequest) -> Bool
+    {
+        guard self.canApplyHistory(request) else { return false }
+        let incoming = Self.decodeMessages(payload.messages ?? [])
+        if !incoming.isEmpty {
+            let reconciled = Self.reconcileMessageIDs(
+                previous: self.messages,
+                incoming: self.messages + incoming)
+            self.replaceMessages(Self.dedupeMessages(reconciled))
+            self.prunePendingLocalUserEchoMessageIDs()
+            self.clearProvisionalFinalMarkersAdoptedByHistory(incoming)
+            self.pruneProvisionalFinalMessages()
+            self.pruneRunMessageScopes()
+        }
+        if let sessionId = payload.sessionId {
+            self.sessionId = sessionId
+        }
+        // The cursor echo advances past projection-filtered raw entries, so it
+        // is authoritative over the max message seq visible on the page.
+        if let nextAfterSeq = payload.nextAfterSeq {
+            self.lastAppliedTranscriptSeq = max(self.lastAppliedTranscriptSeq ?? 0, nextAfterSeq)
+        }
+        // Same invalidation gate as applyHistoryPayload: only a page that shows
+        // the latest user turn answered may reject older in-flight responses.
+        let canInvalidateOlderHistory = if let latestUserTurn = request.latestUserTurn {
+            Self.hasAnsweredUser(latestUserTurn, in: self.messages)
+        } else {
+            !Self.hasUnansweredLatestUser(in: self.messages)
+        }
+        if canInvalidateOlderHistory {
+            self.markHistoryRequestApplied(request)
+        }
+        return true
+    }
+
+    // Reconnect refetch: with a known cursor, fetch only missed rows and loop
+    // afterSeq = nextAfterSeq while hasMore. A response without the afterSeq
+    // echo means the gateway ignored the cursor param (version skew) and served
+    // a legacy full page; wholesale-replace via the standard path.
+    @discardableResult
+    private func refreshHistoryCatchUp(historyRequest request: HistoryRequest) async -> Bool {
+        guard var afterSeq = self.lastAppliedTranscriptSeq else {
+            return await self.refreshHistoryAfterRun(historyRequest: request)
+        }
+        var appliedAny = false
+        do {
+            while true {
+                let payload = try await transport.requestHistory(
+                    sessionKey: request.session.key,
+                    afterSeq: afterSeq)
+                guard payload.afterSeq != nil, let nextAfterSeq = payload.nextAfterSeq else {
+                    return self.applyHistoryPayload(
+                        payload,
+                        for: request,
+                        preservingOptimisticLocalMessages: true)
+                }
+                guard self.appendHistoryDeltaPage(payload, for: request) else { return appliedAny }
+                appliedAny = true
+                // A non-advancing cursor would loop forever; stop and let the
+                // next reconnect retry from the same position.
+                guard payload.hasMore == true, nextAfterSeq > afterSeq else { return true }
+                afterSeq = nextAfterSeq
+            }
+        } catch {
+            chatUILogger.error("catch-up history failed \(error.localizedDescription, privacy: .public)")
+            return appliedAny
+        }
+    }
+
     private func startBootstrap(sessionKey requestedSessionKey: String? = nil) {
         let sessionKey = requestedSessionKey ?? self.sessionKey
         guard sessionKey == self.sessionKey else { return }
@@ -502,6 +584,9 @@ public final class OpenClawChatViewModel {
         self.pendingToolCallsById = [:]
         self.updateStreamingAssistantText(nil)
         self.sessionId = nil
+        // The bootstrap full fetch re-derives the catch-up cursor; a stale one
+        // from another session/reset must never gate a delta fetch.
+        self.lastAppliedTranscriptSeq = nil
         self.bootstrapTask = Task { [weak self] in
             guard let self else { return }
             await self.bootstrap(context: context)
@@ -568,7 +653,7 @@ public final class OpenClawChatViewModel {
         self.logDiagnostic(
             "chat.ui foreground refresh sessionKey=\(context.session.key) "
                 + "pending=\(self.pendingRunCount)")
-        await self.refreshHistoryAfterRun(historyRequest: context)
+        await self.refreshHistoryCatchUp(historyRequest: context)
         await self.pollHealthIfNeeded(force: true, sessionSnapshot: context.session)
         guard self.isCurrentSession(context.session) else { return }
         if self.hasAssistantMessageAfterLatestUser() {
@@ -613,6 +698,7 @@ public final class OpenClawChatViewModel {
             content: sanitizedContent,
             timestamp: message.timestamp,
             idempotencyKey: message.idempotencyKey,
+            transcriptSeq: message.transcriptSeq,
             toolCallId: message.toolCallId,
             toolName: message.toolName,
             usage: message.usage,
@@ -712,6 +798,7 @@ public final class OpenClawChatViewModel {
             content: incoming.content,
             timestamp: incoming.timestamp ?? existing.timestamp,
             idempotencyKey: incoming.idempotencyKey,
+            transcriptSeq: incoming.transcriptSeq ?? existing.transcriptSeq,
             toolCallId: incoming.toolCallId,
             toolName: incoming.toolName,
             usage: incoming.usage,
@@ -926,6 +1013,7 @@ public final class OpenClawChatViewModel {
                 content: existing.content,
                 timestamp: existing.timestamp,
                 idempotencyKey: remoteKey,
+                transcriptSeq: existing.transcriptSeq,
                 toolCallId: existing.toolCallId,
                 toolName: existing.toolName,
                 usage: existing.usage,
@@ -2152,7 +2240,14 @@ public final class OpenClawChatViewModel {
             self.clearPendingRuns(reason: nil)
             let context = self.beginHistoryRequest()
             Task {
-                await self.refreshHistoryAfterRun(historyRequest: context)
+                await self.refreshHistoryCatchUp(historyRequest: context)
+                // The gap drained pendingRuns above, so any streamed text/tool
+                // chips belong to dead runs; without this they linger as a
+                // phantom bubble after the reconcile lands.
+                if self.isCurrentSession(context.session) {
+                    self.pendingToolCallsById = [:]
+                    self.updateStreamingAssistantText(nil)
+                }
                 await self.pollHealthIfNeeded(force: true, sessionSnapshot: context.session)
             }
         }
@@ -2309,6 +2404,7 @@ public final class OpenClawChatViewModel {
             content: message.content,
             timestamp: Date().timeIntervalSince1970 * 1000,
             idempotencyKey: message.idempotencyKey,
+            transcriptSeq: message.transcriptSeq,
             toolCallId: message.toolCallId,
             toolName: message.toolName,
             usage: message.usage,

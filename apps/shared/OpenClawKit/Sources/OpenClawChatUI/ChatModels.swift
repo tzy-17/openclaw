@@ -185,6 +185,7 @@ public struct OpenClawChatMessageContent: Codable, Hashable, Sendable {
 public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
     private struct OpenClawMetadata: Codable {
         let idempotencyKey: String?
+        let seq: Int?
     }
 
     public var id: UUID = .init()
@@ -192,6 +193,9 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
     public let content: [OpenClawChatMessageContent]
     public let timestamp: Double?
     public let idempotencyKey: String?
+    // Gateway transcript position (`__openclaw.seq`); drives the chat.history
+    // afterSeq catch-up cursor. Inbound-only: never re-encoded to the gateway.
+    public let transcriptSeq: Int?
     public let toolCallId: String?
     public let toolName: String?
     public let usage: OpenClawChatUsage?
@@ -219,6 +223,7 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         content: [OpenClawChatMessageContent],
         timestamp: Double?,
         idempotencyKey: String? = nil,
+        transcriptSeq: Int? = nil,
         toolCallId: String? = nil,
         toolName: String? = nil,
         usage: OpenClawChatUsage? = nil,
@@ -230,6 +235,7 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         self.content = content
         self.timestamp = timestamp
         self.idempotencyKey = idempotencyKey
+        self.transcriptSeq = transcriptSeq
         self.toolCallId = toolCallId
         self.toolName = toolName
         self.usage = usage
@@ -257,6 +263,7 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         self.role = decodedRole
         self.timestamp = decodedTimestamp
         self.idempotencyKey = decodedIdempotencyKey
+        self.transcriptSeq = decodedOpenClaw?.seq
         self.toolCallId = decodedToolCallId
         self.toolName = decodedToolName
         self.usage = decodedUsage
@@ -343,6 +350,33 @@ public struct OpenClawChatHistoryPayload: Codable, Sendable {
     public let sessionId: String?
     public let messages: [AnyCodable]?
     public let thinkingLevel: String?
+    // chat.history afterSeq catch-up cursor echo. Gateways that ignore the
+    // afterSeq request param (version skew) omit all cursor fields; that
+    // absence is the signal to treat the response as a legacy full page.
+    public let afterSeq: Int?
+    public let nextAfterSeq: Int?
+    public let hasMore: Bool?
+    public let totalMessages: Int?
+
+    public init(
+        sessionKey: String,
+        sessionId: String?,
+        messages: [AnyCodable]?,
+        thinkingLevel: String?,
+        afterSeq: Int? = nil,
+        nextAfterSeq: Int? = nil,
+        hasMore: Bool? = nil,
+        totalMessages: Int? = nil)
+    {
+        self.sessionKey = sessionKey
+        self.sessionId = sessionId
+        self.messages = messages
+        self.thinkingLevel = thinkingLevel
+        self.afterSeq = afterSeq
+        self.nextAfterSeq = nextAfterSeq
+        self.hasMore = hasMore
+        self.totalMessages = totalMessages
+    }
 }
 
 public struct OpenClawSessionPreviewItem: Codable, Hashable, Sendable {

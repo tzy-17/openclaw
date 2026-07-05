@@ -16,6 +16,8 @@ public protocol OpenClawChatTransport: Sendable {
         parentSessionKey: String?) async throws -> OpenClawChatCreateSessionResponse
 
     func requestHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload
+    /// Catch-up fetch: only transcript entries with seq > afterSeq, oldest-first.
+    func requestHistory(sessionKey: String, afterSeq: Int) async throws -> OpenClawChatHistoryPayload
     func listModels() async throws -> [OpenClawChatModelChoice]
     var supportsSlashCommandCatalog: Bool { get }
     func listCommands(sessionKey: String) async throws -> [OpenClawChatCommandChoice]
@@ -50,6 +52,15 @@ extension OpenClawChatTransport {
             domain: "OpenClawChatTransport",
             code: 0,
             userInfo: [NSLocalizedDescriptionKey: "sessions.create not supported by this transport"])
+    }
+
+    public func requestHistory(
+        sessionKey: String,
+        afterSeq _: Int) async throws -> OpenClawChatHistoryPayload
+    {
+        // Transports without cursor support serve a legacy full page. The
+        // missing afterSeq echo tells the view model to wholesale-replace.
+        try await self.requestHistory(sessionKey: sessionKey)
     }
 
     public func setActiveSessionKey(_: String) async throws {}

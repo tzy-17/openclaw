@@ -146,9 +146,12 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         try self.encodeParams(SessionKeyParams(key: sessionKey))
     }
 
-    private static func makeHistoryParamsJSON(sessionKey: String) throws -> String {
-        struct Params: Codable { var sessionKey: String }
-        return try self.encodeParams(Params(sessionKey: sessionKey))
+    private static func makeHistoryParamsJSON(sessionKey: String, afterSeq: Int? = nil) throws -> String {
+        struct Params: Codable {
+            var sessionKey: String
+            var afterSeq: Int?
+        }
+        return try self.encodeParams(Params(sessionKey: sessionKey, afterSeq: afterSeq))
     }
 
     private static func makeAgentWaitParamsJSON(runId: String, timeoutMs: Int) throws -> String {
@@ -215,6 +218,12 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
 
     func requestHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload {
         let json = try Self.makeHistoryParamsJSON(sessionKey: sessionKey)
+        let res = try await self.gateway.request(method: "chat.history", paramsJSON: json, timeoutSeconds: 15)
+        return try JSONDecoder().decode(OpenClawChatHistoryPayload.self, from: res)
+    }
+
+    func requestHistory(sessionKey: String, afterSeq: Int) async throws -> OpenClawChatHistoryPayload {
+        let json = try Self.makeHistoryParamsJSON(sessionKey: sessionKey, afterSeq: afterSeq)
         let res = try await self.gateway.request(method: "chat.history", paramsJSON: json, timeoutSeconds: 15)
         return try JSONDecoder().decode(OpenClawChatHistoryPayload.self, from: res)
     }
