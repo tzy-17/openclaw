@@ -48,7 +48,7 @@ public final class OpenClawChatViewModel {
 
     private(set) var timelineRevision: UInt64 = 0
     public private(set) var sessions: [OpenClawChatSessionEntry] = []
-    private let transport: any OpenClawChatTransport
+    let transport: any OpenClawChatTransport
     private var sessionDefaults: OpenClawChatSessionsDefaults?
     private let prefersExplicitThinkingLevel: Bool
     private let onSessionChanged: (@MainActor (String) -> Void)?
@@ -84,7 +84,7 @@ public final class OpenClawChatViewModel {
     /// current session; reconnect catch-up fetches only rows after it. Push events
     /// never advance it: after a detected seq gap the missed rows must still fall
     /// inside the next afterSeq delta fetch.
-    private var lastAppliedTranscriptSeq: Int?
+    var lastAppliedTranscriptSeq: Int?
 
     @ObservationIgnored
     private nonisolated(unsafe) var pendingRunTimeoutTasks: [String: Task<Void, Never>] = [:]
@@ -117,7 +117,7 @@ public final class OpenClawChatViewModel {
         case externalSync
     }
 
-    private struct SessionSnapshot {
+    struct SessionSnapshot {
         var key: String
         var generation: UInt64
     }
@@ -131,13 +131,13 @@ public final class OpenClawChatViewModel {
         }
     }
 
-    private struct HistoryRequest {
+    struct HistoryRequest {
         var id: UInt64
         var session: SessionSnapshot
         var latestUserTurn: LatestUserTurn?
     }
 
-    private struct LatestUserTurn {
+    struct LatestUserTurn {
         var idempotencyKey: String?
         var refreshKey: String?
         var occurrence: Int
@@ -447,7 +447,7 @@ public final class OpenClawChatViewModel {
     }
 
     @discardableResult
-    private func applyHistoryPayload(
+    func applyHistoryPayload(
         _ payload: OpenClawChatHistoryPayload,
         for request: HistoryRequest,
         preservingOptimisticLocalMessages: Bool,
@@ -497,7 +497,7 @@ public final class OpenClawChatViewModel {
     /// Appends a catch-up page through the same reconcile/dedupe path used for
     /// pushed session rows; idempotency-keyed adoption and dedupe absorb overlap
     /// from lossless re-delivery of budget-trimmed rows.
-    private func appendHistoryDeltaPage(
+    func appendHistoryDeltaPage(
         _ payload: OpenClawChatHistoryPayload,
         for request: HistoryRequest) -> Bool
     {
@@ -535,67 +535,6 @@ public final class OpenClawChatViewModel {
             self.markHistoryRequestApplied(request)
         }
         return true
-    }
-
-    /// Puts seq-stamped transcript rows back into seq order while seq-less rows
-    /// (optimistic echoes, provisional finals) stay anchored at their positions.
-    private static func reorderTranscriptSeqRows(
-        _ messages: [OpenClawChatMessage]) -> [OpenClawChatMessage]
-    {
-        let seqIndices = messages.indices.filter { messages[$0].transcriptSeq != nil }
-        guard seqIndices.count > 1 else { return messages }
-        let orderedRows = seqIndices.map { messages[$0] }
-            .sorted { ($0.transcriptSeq ?? 0) < ($1.transcriptSeq ?? 0) }
-        var result = messages
-        for (offset, index) in seqIndices.enumerated() {
-            result[index] = orderedRows[offset]
-        }
-        return result
-    }
-
-    /// Reconnect refetch: with a known cursor, fetch only missed rows and loop
-    /// afterSeq = nextAfterSeq while hasMore. A response without the afterSeq
-    /// echo means the gateway ignored the cursor param (version skew) and served
-    /// a legacy full page; wholesale-replace via the standard path.
-    @discardableResult
-    private func refreshHistoryCatchUp(historyRequest request: HistoryRequest) async -> Bool {
-        guard var afterSeq = self.lastAppliedTranscriptSeq else {
-            return await self.refreshHistoryAfterRun(historyRequest: request)
-        }
-        var appliedAny = false
-        do {
-            while true {
-                let payload = try await transport.requestHistory(
-                    sessionKey: request.session.key,
-                    afterSeq: afterSeq)
-                guard payload.afterSeq != nil else {
-                    return self.applyHistoryPayload(
-                        payload,
-                        for: request,
-                        preservingOptimisticLocalMessages: true)
-                }
-                guard
-                    payload.afterSeq == afterSeq,
-                    let expectedSessionId = self.sessionId,
-                    payload.sessionId == expectedSessionId,
-                    let nextAfterSeq = payload.nextAfterSeq,
-                    nextAfterSeq >= afterSeq
-                else {
-                    return await self.refreshHistoryAfterRun(historyRequest: request)
-                }
-                if payload.hasMore == true, nextAfterSeq == afterSeq {
-                    return await self.refreshHistoryAfterRun(historyRequest: request)
-                }
-                guard self.appendHistoryDeltaPage(payload, for: request) else { return appliedAny }
-                appliedAny = true
-                guard payload.hasMore == true else { return true }
-                afterSeq = nextAfterSeq
-            }
-        } catch {
-            chatUILogger.error("catch-up history failed \(error.localizedDescription, privacy: .public)")
-            let refetched = await self.refreshHistoryAfterRun(historyRequest: request)
-            return refetched || appliedAny
-        }
     }
 
     private func startBootstrap(sessionKey requestedSessionKey: String? = nil) {
@@ -2427,28 +2366,6 @@ public final class OpenClawChatViewModel {
         message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant"
     }
 
-    /// The session.message envelope mirrors the row's transcript seq; adopt it
-    /// when the projected body lost the metadata so seq-gap delta reordering can
-    /// still place the pushed row at its transcript position.
-    private static func messageWithTranscriptSeqIfMissing(
-        _ message: OpenClawChatMessage,
-        seq: Int?) -> OpenClawChatMessage
-    {
-        guard message.transcriptSeq == nil, let seq, seq > 0 else { return message }
-        return OpenClawChatMessage(
-            id: message.id,
-            role: message.role,
-            content: message.content,
-            timestamp: message.timestamp,
-            idempotencyKey: message.idempotencyKey,
-            transcriptSeq: seq,
-            toolCallId: message.toolCallId,
-            toolName: message.toolName,
-            usage: message.usage,
-            stopReason: message.stopReason,
-            errorMessage: message.errorMessage)
-    }
-
     private static func messageWithTimestampIfNeeded(_ message: OpenClawChatMessage) -> OpenClawChatMessage {
         guard message.timestamp == nil else { return message }
         return OpenClawChatMessage(
@@ -2799,7 +2716,7 @@ public final class OpenClawChatViewModel {
     }
 
     @discardableResult
-    private func refreshHistoryAfterRun(historyRequest request: HistoryRequest? = nil) async -> Bool {
+    func refreshHistoryAfterRun(historyRequest request: HistoryRequest? = nil) async -> Bool {
         let request = request ?? self.beginHistoryRequest()
         do {
             let payload = try await transport.requestHistory(sessionKey: request.session.key)
