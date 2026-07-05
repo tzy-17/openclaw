@@ -32,6 +32,8 @@ export function buildGatewaySessionEventFields(params: {
     subagentRole: sessionRow.subagentRole,
     subagentControlScope: sessionRow.subagentControlScope,
     label: params.label ?? sessionRow.label,
+    // Explicit null so subscribed clients drop a cleared category during merge-reconcile.
+    category: sessionRow.category ?? null,
     displayName: params.displayName ?? sessionRow.displayName,
     deliveryContext: sessionRow.deliveryContext,
     parentSessionKey: params.parentSessionKey ?? sessionRow.parentSessionKey,
