@@ -183,7 +183,7 @@ export function buildThreadingToolContext(params: {
     // Some providers expose only thread resources as reply targets; explicit
     // `undefined` means the adapter rejected the generic message-id fallback.
     currentMessageId: hasAdapterCurrentMessageId ? context.currentMessageId : currentMessageId,
-    ...(params.isHeartbeat ? { isHeartbeat: true } : {}),
+    ...(isHeartbeat ? { isHeartbeat: true } : {}),
   };
 }
 
